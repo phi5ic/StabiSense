@@ -1,7 +1,7 @@
-[seismic-monitor.md](https://github.com/user-attachments/files/28197257/seismic-monitor.md)
+##StabiSense: A Self Calibrating IMU-Based Micro-Scale Stabilization System with Real time Adaptive Control.
 ---
 publishDate: 2025-01-01T00:00:00Z
-title: ESP32 Seismic & Tremor Monitor
+title: StabiSense: A Self Calibrating IMU-Based Micro-Scale Stabilization System with Real time Adaptive Control.
 excerpt: A real-time seismic monitoring system using an ESP32 and MYOSA sensor kit that classifies motion events into four severity levels using an on-device TinyML model, with a browser-based telemetry dashboard for live analysis, event replay, and data export.
 image: seismic-monitor/cover.jpg
 tags:
