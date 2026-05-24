@@ -59,9 +59,12 @@ The model classifies incoming motion into one of four states in real time. A loc
 
 ### **Videos**
 
-<video controls width="100%">
-  <source src="demo_YP5JgmB8.mp4" type="video/mp4">
-</video>
+<p align="center">
+  <a href="https://github.com/phi5ic/StabiSense/raw/main/demo_YP5JgmB8.mp4">
+    <img src="dashboard-live-seismic.jpeg" width="800"><br/>
+    <i>▶ Click to watch demo video</i>
+  </a>
+</p>
 
 ---
 
