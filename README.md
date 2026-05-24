@@ -1,4 +1,4 @@
-##StabiSense: A Self Calibrating IMU-Based Micro-Scale Stabilization System with Real time Adaptive Control.
+StabiSense: A Self Calibrating IMU-Based Micro-Scale Stabilization System with Real time Adaptive Control.
 ---
 publishDate: 2025-01-01T00:00:00Z
 title: StabiSense: A Self Calibrating IMU-Based Micro-Scale Stabilization System with Real time Adaptive Control.
