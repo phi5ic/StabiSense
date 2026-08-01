@@ -5,9 +5,28 @@
 #include "Display_Module.h"
 #include "LightProximityAndGesture.h"
 
-#define BUZZER_PIN 12
+// NOTE: GPIO12 is an ESP32 strapping pin (MTDI) -- it's sampled at boot to
+// help select flash voltage. An external circuit (like a buzzer) that loads
+// this pin during reset can cause intermittent boot failures or the chip
+// choosing the wrong flash voltage. Moved to GPIO27, which is not a
+// strapping pin, not used for the I2C bus (21/22), and not ADC2-only in a
+// way that matters here.
+#define BUZZER_PIN 27
+
+// Bounded wait for the shared I2C mutex. The previous portMAX_DELAY on every
+// take meant that if anything ever held the mutex and hung, gesture polling
+// and display updates would block forever with no way to recover. On a
+// timeout we just skip that cycle -- same as "no gesture this loop" today,
+// but now bounded instead of an indefinite stall.
+#define I2C_MUTEX_TIMEOUT_TICKS pdMS_TO_TICKS(50)
+
+// Telemetry schema version for the machine-readable DATA line below. Bump
+// this if the field order/count changes so a dashboard parser can detect
+// a mismatch instead of silently misreading fields.
+#define TELEMETRY_SCHEMA_VERSION 1
 
 SemaphoreHandle_t i2cMutex;
+
 unsigned long lastDisplayUpdate = 0;
 unsigned long lastAlarmBeep = 0;
 
@@ -50,10 +69,34 @@ void changePage(int newPage) {
   else if (pageIndex == 3) setScreenPage(PAGE_CALIBRATION_LEVEL);
 }
 
+// Emits a single-line, versioned, comma-delimited record intended for the
+// browser dashboard to parse, separate from the human-readable debug print
+// below. The previous protocol was implicitly "whatever Serial.print calls
+// happen to produce," which breaks silently if that formatting ever changes.
+// This does not by itself update index.html's parser -- that still needs a
+// matching change -- but it gives it something stable to parse against.
+static void printTelemetryLine(const SystemData &d, int page, bool paused) {
+  Serial.print("DATA,");
+  Serial.print(TELEMETRY_SCHEMA_VERSION); Serial.print(',');
+  Serial.print(millis()); Serial.print(',');
+  Serial.print(d.roll, 2); Serial.print(',');
+  Serial.print(d.pitch, 2); Serial.print(',');
+  Serial.print(d.accX, 3); Serial.print(',');
+  Serial.print(d.accY, 3); Serial.print(',');
+  Serial.print(d.accZ, 3); Serial.print(',');
+  Serial.print(d.linearAcc, 3); Serial.print(',');
+  Serial.print(d.gyroMag, 1); Serial.print(',');
+  Serial.print(d.motionScore, 2); Serial.print(',');
+  Serial.print(d.aiClass); Serial.print(',');
+  Serial.print(d.aiConfidence, 3); Serial.print(',');
+  Serial.print(d.detectionSource); Serial.print(',');
+  Serial.print(page); Serial.print(',');
+  Serial.println(paused ? 1 : 0);
+}
+
 void setup() {
   Serial.begin(115200);
   delay(500);
-
   Serial.println();
   Serial.println("===== SEISMIC MONITOR BOOT =====");
 
@@ -74,7 +117,7 @@ void setup() {
   initBMP();
   initIMU();
 
-  if (xSemaphoreTake(i2cMutex, portMAX_DELAY)) {
+  if (xSemaphoreTake(i2cMutex, I2C_MUTEX_TIMEOUT_TICKS)) {
     if (gestureSensor.ping()) {
       gestureSensor.enableGestureSensor();
       myosaGestureReady = true;
@@ -84,15 +127,16 @@ void setup() {
       Serial.println(">>> MYOSA Gesture Sensor not found / disabled.");
     }
     xSemaphoreGive(i2cMutex);
+  } else {
+    myosaGestureReady = false;
+    Serial.println(">>> Gesture Sensor init skipped: I2C bus busy.");
   }
 
   delay(1200);
   changePage(1);
-
   playBeep(1000, 100);
   delay(150);
   playBeep(1500, 150);
-
   Serial.println("===== BOOT COMPLETE =====");
 }
 
@@ -114,9 +158,12 @@ void loop() {
   sysData.detectionSource = getDetectionSource();
 
   String swipe = "NONE";
-  if (myosaGestureReady && xSemaphoreTake(i2cMutex, portMAX_DELAY)) {
-    swipe = String(gestureSensor.getGesture(false));
-    xSemaphoreGive(i2cMutex);
+  if (myosaGestureReady) {
+    if (xSemaphoreTake(i2cMutex, I2C_MUTEX_TIMEOUT_TICKS)) {
+      swipe = String(gestureSensor.getGesture(false));
+      xSemaphoreGive(i2cMutex);
+    }
+    // else: bus busy this cycle -- treat as no gesture instead of stalling.
   }
 
   if (swipe != "NONE") {
@@ -164,6 +211,7 @@ void loop() {
     Serial.print(" Pause:"); Serial.println(telemetryPaused ? "Y" : "N");
 
     if (!telemetryPaused) {
+      printTelemetryLine(sysData, pageIndex, telemetryPaused);
       updateDisplay(sysData);
     }
 

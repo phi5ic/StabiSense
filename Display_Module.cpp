@@ -8,8 +8,14 @@
 #define OLED_RESET -1
 #define OLED_ADDR 0x3C
 
+// See IMU_Module.cpp for the same constant/rationale -- unbounded
+// portMAX_DELAY waits on a shared mutex mean one hung task can freeze
+// every other consumer of the I2C bus forever. Bounded here too.
+#define I2C_MUTEX_TIMEOUT_TICKS pdMS_TO_TICKS(50)
+
 static Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 static ScreenPage currentPage = PAGE_SPLASH;
+
 static int rollHistory[128];
 static int pitchHistory[128];
 static int motionHistory[128];
@@ -37,7 +43,6 @@ static const char* sourceName(int s) {
 static void drawDashboard(SystemData data) {
   display.setTextSize(1);
   display.setTextColor(SSD1306_WHITE);
-
   display.setCursor(0, 0);
   display.print("AI DASH ");
   display.print(data.aiReady ? "ML" : "NO-ML");
@@ -86,6 +91,7 @@ static void drawOscilloscope(SystemData data) {
   display.setTextSize(1);
   display.setCursor(0, 0);
   display.print("ROLL/PITCH/MOTION");
+
   display.drawLine(0, 16, 127, 16, SSD1306_WHITE);
   display.drawLine(0, 48, 127, 48, SSD1306_WHITE);
 
@@ -109,7 +115,6 @@ static void drawCalibrationLevel(SystemData data) {
 
   int dotX = centerX + map((long)data.roll, -45, 45, -30, 30);
   int dotY = centerY + map((long)data.pitch, -45, 45, 30, -30);
-
   dotX = constrain(dotX, centerX - 30, centerX + 30);
   dotY = constrain(dotY, centerY - 30, centerY + 30);
 
@@ -132,9 +137,8 @@ void initDisplay() {
     return;
   }
 
-  if (xSemaphoreTake(i2cMutex, portMAX_DELAY)) {
+  if (xSemaphoreTake(i2cMutex, I2C_MUTEX_TIMEOUT_TICKS)) {
     displayReady = display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR);
-
     if (!displayReady) {
       Serial.println("OLED allocation failed");
       xSemaphoreGive(i2cMutex);
@@ -150,7 +154,11 @@ void initDisplay() {
     display.setTextSize(1);
     display.print("BOOTING...");
     display.display();
+
     xSemaphoreGive(i2cMutex);
+  } else {
+    Serial.println("OLED init skipped: I2C bus busy.");
+    return;
   }
 
   for (int i = 0; i < 128; i++) {
@@ -177,23 +185,20 @@ void updateDisplay(SystemData data) {
     display.setTextSize(2);
     display.setCursor(8, 4);
     display.print("WARNING");
-
     display.setTextSize(1);
     display.setCursor(8, 28);
     display.print(className(data.aiClass));
     display.print(" DETECTED");
-
     display.setCursor(8, 42);
     display.print("Conf:");
     display.print(data.aiConfidence * 100.0f, 0);
     display.print("% ");
     display.print(sourceName(data.detectionSource));
-
     display.setCursor(8, 55);
     display.print("Motion:");
     display.print(data.motionScore, 2);
 
-    if (xSemaphoreTake(i2cMutex, portMAX_DELAY)) {
+    if (xSemaphoreTake(i2cMutex, I2C_MUTEX_TIMEOUT_TICKS)) {
       display.display();
       xSemaphoreGive(i2cMutex);
     }
@@ -217,7 +222,7 @@ void updateDisplay(SystemData data) {
       break;
   }
 
-  if (xSemaphoreTake(i2cMutex, portMAX_DELAY)) {
+  if (xSemaphoreTake(i2cMutex, I2C_MUTEX_TIMEOUT_TICKS)) {
     display.display();
     xSemaphoreGive(i2cMutex);
   }

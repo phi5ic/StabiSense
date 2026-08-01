@@ -30,7 +30,12 @@
 #define SERIAL_DEBUG_INTERVAL_MS 1000
 
 // Rule-based detection tuning.
-// Increase these if it becomes too sensitive.
+// NOTE: these are empirically-chosen starting points from bench testing on
+// one unit, not a calibrated-per-device or dataset-derived set of numbers.
+// If you see too many false TREMOR/LANDSLIDE triggers (or missed events),
+// set LOG_CALIBRATION_METRICS to 1 below, collect a few minutes of CSV
+// output across IDLE / TREMOR / LANDSLIDE / SEISMIC motion, and re-derive
+// these thresholds from that data rather than adjusting them blind.
 #define TREMOR_LINEAR_ACC_THRESHOLD 0.08f
 #define TREMOR_GYRO_THRESHOLD 18.0f
 #define SEISMIC_LINEAR_ACC_THRESHOLD 0.28f
@@ -39,8 +44,51 @@
 #define LANDSLIDE_LINEAR_ACC_THRESHOLD 0.05f
 #define EVENT_HOLD_MS 1200
 
+// --- Concurrency ---
+// i2cMutex protects the shared I2C bus. Every previous xSemaphoreTake() call
+// used portMAX_DELAY, i.e. an unbounded wait -- if any task holding the
+// mutex ever hangs, everything else on the bus deadlocks forever with no
+// way to recover or even detect it. All takes now use a bounded timeout;
+// on timeout we skip that cycle instead of blocking indefinitely.
+#define I2C_MUTEX_TIMEOUT_TICKS pdMS_TO_TICKS(50)
+
+// detectionMux protects the fields written here on core 1 (imuTask) and
+// read from core 0 (loop(), via the getters below). `volatile` alone does
+// NOT make a multi-byte read/write atomic across cores -- this closes that
+// gap with a real (cheap, uncontended) critical section.
+static portMUX_TYPE detectionMux = portMUX_INITIALIZER_UNLOCKED;
+
+// --- Feature normalization (see README "Contribution Notes") ---
+// The README's retraining guidance says normalization constants must be
+// baked into firmware so inference input matches training input. Previously
+// nothing here actually normalized anything, which is a real train/inference
+// mismatch risk if the shipped model *was* trained on normalized data.
+// These are placeholders -- compute real per-feature mean/std from your
+// training set and fill them in. USE_FEATURE_NORMALIZATION defaults to 0
+// so this patch does not silently change the shipped model's behavior;
+// flip it to 1 only after you've filled in real constants below.
+#define USE_FEATURE_NORMALIZATION 0
+// Order matches the feature order used everywhere else: roll, pitch, ax, ay, az
+static const float FEATURE_MEAN[FEATURES_PER_SAMPLE] = {0.0f, 0.0f, 0.0f, 0.0f, 1.0f};
+static const float FEATURE_STD[FEATURES_PER_SAMPLE]  = {1.0f, 1.0f, 1.0f, 1.0f, 1.0f};
+
+// Set to 1 to print raw motion metrics as CSV every sample, for offline
+// threshold calibration. Leave at 0 for normal operation -- this is verbose.
+#define LOG_CALIBRATION_METRICS 0
+
 static Eloquent::TF::Sequential<TF_NUM_OPS, TENSOR_ARENA_SIZE> ml;
-static float ringBuffer[NUMBER_OF_INPUTS] = {0.0f};
+
+// True circular buffer for incoming samples -- O(1) per-sample write.
+// The flat `ringBuffer` the model actually consumes is assembled
+// (linearized) only right before inference, at most every
+// INFERENCE_INTERVAL_MS -- not on every 10ms sample. The previous
+// implementation did a ~4KB memmove on every single sample (~400KB/s of
+// memory traffic) just to keep a sliding window; this does the same job
+// for a fraction of the cost.
+static float sampleRing[SAMPLES_PER_WINDOW][FEATURES_PER_SAMPLE];
+static float ringBuffer[NUMBER_OF_INPUTS] = {0.0f}; // linearized inference input
+static int ringWriteIdx = 0;
+
 static Mahony filter;
 
 static uint8_t mpuAddress = MPU6050_ADDR_PRIMARY;
@@ -92,16 +140,13 @@ static bool i2cReadBytes(uint8_t reg, uint8_t *buffer, size_t length) {
   if (Wire.endTransmission(false) != 0) {
     return false;
   }
-
   size_t received = Wire.requestFrom((uint16_t)mpuAddress, length, true);
   if (received < length) {
     return false;
   }
-
   for (size_t i = 0; i < length; i++) {
     buffer[i] = Wire.read();
   }
-
   return true;
 }
 
@@ -115,31 +160,47 @@ static bool detectMPUAddress() {
     mpuAddress = MPU6050_ADDR_PRIMARY;
     return true;
   }
-
   if (pingMPU(MPU6050_ADDR_FALLBACK)) {
     mpuAddress = MPU6050_ADDR_FALLBACK;
     return true;
   }
-
   return false;
 }
 
+// O(1): write the newest sample into the circular buffer and advance the
+// write pointer. No shifting of existing data.
 static void pushToBuffer(float r, float p, float ax, float ay, float az) {
-  memmove(ringBuffer, &ringBuffer[FEATURES_PER_SAMPLE],
-          (NUMBER_OF_INPUTS - FEATURES_PER_SAMPLE) * sizeof(float));
-
-  // IMPORTANT:
-  // This is the same feature order used by the previous code:
-  // roll, pitch, accX, accY, accZ.
-  // The fallback detector below does not depend on the model being perfect.
-  ringBuffer[NUMBER_OF_INPUTS - 5] = r;
-  ringBuffer[NUMBER_OF_INPUTS - 4] = p;
-  ringBuffer[NUMBER_OF_INPUTS - 3] = ax;
-  ringBuffer[NUMBER_OF_INPUTS - 2] = ay;
-  ringBuffer[NUMBER_OF_INPUTS - 1] = az;
+  sampleRing[ringWriteIdx][0] = r;
+  sampleRing[ringWriteIdx][1] = p;
+  sampleRing[ringWriteIdx][2] = ax;
+  sampleRing[ringWriteIdx][3] = ay;
+  sampleRing[ringWriteIdx][4] = az;
+  ringWriteIdx = (ringWriteIdx + 1) % SAMPLES_PER_WINDOW;
 
   if (sampleCount < SAMPLES_PER_WINDOW) {
     sampleCount++;
+  }
+}
+
+// Flattens the circular buffer into chronological (oldest-to-newest) order
+// for the model, applying feature normalization if enabled. Only called
+// right before inference (see runDetection()), i.e. at most every
+// INFERENCE_INTERVAL_MS -- this is the one place the O(SAMPLES_PER_WINDOW)
+// cost is actually paid, instead of on every sample.
+static void linearizeWindowForInference() {
+  // Called only once the buffer is full (guarded in runDetection), so the
+  // oldest sample is always exactly at the current write pointer.
+  int oldest = ringWriteIdx;
+  for (int i = 0; i < SAMPLES_PER_WINDOW; i++) {
+    int src = (oldest + i) % SAMPLES_PER_WINDOW;
+    int dst = i * FEATURES_PER_SAMPLE;
+    for (int f = 0; f < FEATURES_PER_SAMPLE; f++) {
+      float v = sampleRing[src][f];
+#if USE_FEATURE_NORMALIZATION
+      v = (v - FEATURE_MEAN[f]) / FEATURE_STD[f];
+#endif
+      ringBuffer[dst + f] = v;
+    }
   }
 }
 
@@ -151,7 +212,6 @@ static void registerModelOps() {
   ml.resolver.AddShape();
   ml.resolver.AddRelu();
   ml.resolver.AddSoftmax();
-
   // These are common in Keras-converted TFLite models.
   // If your library does not compile one of these, comment that one line only.
   ml.resolver.AddPad();
@@ -164,14 +224,12 @@ static void registerModelOps() {
 static int argmaxOutput() {
   int best = 0;
   float bestValue = ml.outputs[0];
-
   for (int i = 1; i < NUMBER_OF_OUTPUTS; i++) {
     if (ml.outputs[i] > bestValue) {
       bestValue = ml.outputs[i];
       best = i;
     }
   }
-
   return best;
 }
 
@@ -188,62 +246,80 @@ static void computeMotionMetrics(float gx, float gy, float gz, float ax, float a
   float tiltMag = fabsf(roll) + fabsf(pitch);
 
   // Smooth values so the display is stable, but still responsive.
-  linearAcceleration = (linearAcceleration * 0.75f) + (linAcc * 0.25f);
-  gyroMagnitude = (gyroMagnitude * 0.75f) + (gyroMag * 0.25f);
-  tiltMagnitude = (tiltMagnitude * 0.80f) + (tiltMag * 0.20f);
+  // These fields are read from the other core via getters, so writes are
+  // done inside a critical section (see detectionMux above).
+  float newLinAcc, newGyroMag, newTiltMag;
+  portENTER_CRITICAL(&detectionMux);
+  newLinAcc  = (linearAcceleration * 0.75f) + (linAcc * 0.25f);
+  newGyroMag = (gyroMagnitude * 0.75f) + (gyroMag * 0.25f);
+  newTiltMag = (tiltMagnitude * 0.80f) + (tiltMag * 0.20f);
+  linearAcceleration = newLinAcc;
+  gyroMagnitude = newGyroMag;
+  tiltMagnitude = newTiltMag;
+  portEXIT_CRITICAL(&detectionMux);
 
-  float accScore = linearAcceleration / SEISMIC_LINEAR_ACC_THRESHOLD;
-  float gyroScore = gyroMagnitude / SEISMIC_GYRO_THRESHOLD;
-  float tiltScore = tiltMagnitude / LANDSLIDE_TILT_THRESHOLD;
+  float accScore = newLinAcc / SEISMIC_LINEAR_ACC_THRESHOLD;
+  float gyroScore = newGyroMag / SEISMIC_GYRO_THRESHOLD;
+  float tiltScore = newTiltMag / LANDSLIDE_TILT_THRESHOLD;
 
   float score = accScore;
   if (gyroScore > score) score = gyroScore;
   if (tiltScore > score) score = tiltScore;
 
+  portENTER_CRITICAL(&detectionMux);
   motionScore = clamp01(score);
+  portEXIT_CRITICAL(&detectionMux);
+
+#if LOG_CALIBRATION_METRICS
+  // CSV: millis,linearAcc,gyroMag,tiltMag,motionScore -- pipe this to a file
+  // and use it to re-derive the thresholds above from real data.
+  Serial.print(millis()); Serial.print(',');
+  Serial.print(newLinAcc, 4); Serial.print(',');
+  Serial.print(newGyroMag, 2); Serial.print(',');
+  Serial.print(newTiltMag, 2); Serial.print(',');
+  Serial.println(clamp01(score), 4);
+#endif
 }
 
-static void ruleBasedDetection(int &ruleClass, float &ruleConfidence) {
+static void ruleBasedDetection(int &ruleClass, float &ruleConfidence, float linAcc, float gyroMag, float tiltMag, float mScore) {
   ruleClass = 0;
   ruleConfidence = 0.0f;
 
-  bool strongShake = (linearAcceleration >= SEISMIC_LINEAR_ACC_THRESHOLD) ||
-                     (gyroMagnitude >= SEISMIC_GYRO_THRESHOLD);
+  bool strongShake = (linAcc >= SEISMIC_LINEAR_ACC_THRESHOLD) ||
+                      (gyroMag >= SEISMIC_GYRO_THRESHOLD);
 
-  bool tremor = (linearAcceleration >= TREMOR_LINEAR_ACC_THRESHOLD) ||
-                (gyroMagnitude >= TREMOR_GYRO_THRESHOLD);
+  bool tremor = (linAcc >= TREMOR_LINEAR_ACC_THRESHOLD) ||
+                (gyroMag >= TREMOR_GYRO_THRESHOLD);
 
-  bool landslide = (tiltMagnitude >= LANDSLIDE_TILT_THRESHOLD &&
-                    linearAcceleration >= LANDSLIDE_LINEAR_ACC_THRESHOLD);
+  bool landslide = (tiltMag >= LANDSLIDE_TILT_THRESHOLD &&
+                     linAcc >= LANDSLIDE_LINEAR_ACC_THRESHOLD);
 
   if (strongShake) {
     ruleClass = 3; // SEISMIC
-    ruleConfidence = clamp01(0.65f + motionScore * 0.35f);
+    ruleConfidence = clamp01(0.65f + mScore * 0.35f);
     return;
   }
-
   if (landslide) {
     ruleClass = 2; // LANDSLIDE
-    ruleConfidence = clamp01(0.60f + motionScore * 0.35f);
+    ruleConfidence = clamp01(0.60f + mScore * 0.35f);
     return;
   }
-
   if (tremor) {
     ruleClass = 1; // TREMOR
-    ruleConfidence = clamp01(0.50f + motionScore * 0.35f);
+    ruleConfidence = clamp01(0.50f + mScore * 0.35f);
     return;
   }
-
   ruleClass = 0;
-  ruleConfidence = clamp01(1.0f - motionScore);
+  ruleConfidence = clamp01(1.0f - mScore);
 }
 
-static void printDebugLine(int modelClass, float modelConfidence, int ruleClass, float ruleConfidence) {
+static void printDebugLine(int modelClass, float modelConfidence, int ruleClass, float ruleConfidence,
+                            float linAcc, float gyroMag, float tiltMag, float mScore,
+                            int finalClassSnapshot, float finalConfSnapshot, int finalSourceSnapshot) {
   uint32_t now = millis();
   if (now - lastDebugMs < SERIAL_DEBUG_INTERVAL_MS) {
     return;
   }
-
   lastDebugMs = now;
 
   Serial.println();
@@ -253,10 +329,10 @@ static void printDebugLine(int modelClass, float modelConfidence, int ruleClass,
   Serial.print("Roll/Pitch: "); Serial.print(currentRoll, 2); Serial.print(" / "); Serial.println(currentPitch, 2);
   Serial.print("Acc(g): "); Serial.print(currentAccX, 3); Serial.print(", "); Serial.print(currentAccY, 3); Serial.print(", "); Serial.println(currentAccZ, 3);
   Serial.print("Gyro(dps): "); Serial.print(currentGyroX, 1); Serial.print(", "); Serial.print(currentGyroY, 1); Serial.print(", "); Serial.println(currentGyroZ, 1);
-  Serial.print("LinearAcc: "); Serial.print((float)linearAcceleration, 3);
-  Serial.print(" | GyroMag: "); Serial.print((float)gyroMagnitude, 1);
-  Serial.print(" | TiltMag: "); Serial.print((float)tiltMagnitude, 1);
-  Serial.print(" | MotionScore: "); Serial.println((float)motionScore, 3);
+  Serial.print("LinearAcc: "); Serial.print(linAcc, 3);
+  Serial.print(" | GyroMag: "); Serial.print(gyroMag, 1);
+  Serial.print(" | TiltMag: "); Serial.print(tiltMag, 1);
+  Serial.print(" | MotionScore: "); Serial.println(mScore, 3);
 
   if (aiReady) {
     Serial.print("ML OUT[0] IDLE: "); Serial.println(ml.outputs[0], 6);
@@ -269,24 +345,34 @@ static void printDebugLine(int modelClass, float modelConfidence, int ruleClass,
   }
 
   Serial.print("Rule class/conf: "); Serial.print(ruleClass); Serial.print(" / "); Serial.println(ruleConfidence, 4);
-  Serial.print("FINAL class/conf/source: "); Serial.print((int)predictedClass); Serial.print(" / "); Serial.print((float)predictionConfidence, 4); Serial.print(" / "); Serial.println((int)detectionSource);
+  Serial.print("FINAL class/conf/source: "); Serial.print(finalClassSnapshot); Serial.print(" / "); Serial.print(finalConfSnapshot, 4); Serial.print(" / "); Serial.println(finalSourceSnapshot);
   Serial.println("==========================");
 }
 
 static void runDetection() {
+  // Snapshot the smoothed metrics once under the lock, then work with
+  // plain locals for the rest of this function -- avoids holding the
+  // critical section for the whole (much longer) detection logic below.
+  float linAcc, gyroMag, tiltMag, mScore;
+  portENTER_CRITICAL(&detectionMux);
+  linAcc = linearAcceleration;
+  gyroMag = gyroMagnitude;
+  tiltMag = tiltMagnitude;
+  mScore = motionScore;
+  portEXIT_CRITICAL(&detectionMux);
+
   int ruleClass = 0;
   float ruleConfidence = 0.0f;
-  ruleBasedDetection(ruleClass, ruleConfidence);
+  ruleBasedDetection(ruleClass, ruleConfidence, linAcc, gyroMag, tiltMag, mScore);
 
   int modelClass = 0;
   float modelConfidence = 0.0f;
-
   bool modelValid = false;
-  uint32_t now = millis();
 
+  uint32_t now = millis();
   if (aiReady && sampleCount >= SAMPLES_PER_WINDOW && now - lastInferenceMs >= INFERENCE_INTERVAL_MS) {
     lastInferenceMs = now;
-
+    linearizeWindowForInference(); // O(SAMPLES_PER_WINDOW), but only here, every INFERENCE_INTERVAL_MS
     if (ml.predict(ringBuffer).isOk()) {
       modelClass = argmaxOutput();
       modelConfidence = ml.outputs[modelClass];
@@ -311,7 +397,7 @@ static void runDetection() {
     finalSource = 1;
   }
 
-  if (ruleClass != 0 && motionScore >= 0.20f) {
+  if (ruleClass != 0 && mScore >= 0.20f) {
     if (!modelValid || modelClass == 0 || modelConfidence < ruleConfidence) {
       finalClass = ruleClass;
       finalConfidence = ruleConfidence;
@@ -331,11 +417,15 @@ static void runDetection() {
     finalSource = heldSource;
   }
 
+  portENTER_CRITICAL(&detectionMux);
   predictedClass = finalClass;
   predictionConfidence = clamp01(finalConfidence);
   detectionSource = finalSource;
+  portEXIT_CRITICAL(&detectionMux);
 
-  printDebugLine(modelClass, modelConfidence, ruleClass, ruleConfidence);
+  printDebugLine(modelClass, modelConfidence, ruleClass, ruleConfidence,
+                 linAcc, gyroMag, tiltMag, mScore,
+                 finalClass, clamp01(finalConfidence), finalSource);
 }
 
 static void imuTask(void *pvParameters) {
@@ -345,7 +435,6 @@ static void imuTask(void *pvParameters) {
     uint32_t currentMicros = micros();
     float dt = (currentMicros - lastMicros) / 1000000.0f;
     lastMicros = currentMicros;
-
     if (dt <= 0.0f || dt > 0.5f) {
       dt = 0.01f;
     }
@@ -353,9 +442,13 @@ static void imuTask(void *pvParameters) {
     bool success = false;
     uint8_t raw[14];
 
-    if (imuReady && i2cMutex != NULL && xSemaphoreTake(i2cMutex, portMAX_DELAY)) {
-      success = i2cReadBytes(0x3B, raw, 14);
-      xSemaphoreGive(i2cMutex);
+    if (imuReady && i2cMutex != NULL) {
+      if (xSemaphoreTake(i2cMutex, I2C_MUTEX_TIMEOUT_TICKS)) {
+        success = i2cReadBytes(0x3B, raw, 14);
+        xSemaphoreGive(i2cMutex);
+      }
+      // else: bus was busy this cycle -- skip and try again next tick
+      // instead of blocking the whole task indefinitely.
     }
 
     if (success) {
@@ -376,19 +469,27 @@ static void imuTask(void *pvParameters) {
 
       filter.updateIMU(gx_deg, gy_deg, gz_deg, ax_g, ay_g, az_g);
 
-      currentRoll = filter.getRoll();
-      currentPitch = filter.getPitch();
+      float roll = filter.getRoll();
+      float pitch = filter.getPitch();
+
+      // These are read from core 0 via getRoll()/getPitch()/getAccX() etc.,
+      // so writes go through the same critical section as the detection
+      // state above.
+      portENTER_CRITICAL(&detectionMux);
+      currentRoll = roll;
+      currentPitch = pitch;
       currentAccX = ax_g;
       currentAccY = ay_g;
       currentAccZ = az_g;
       currentGyroX = gx_deg;
       currentGyroY = gy_deg;
       currentGyroZ = gz_deg;
+      portEXIT_CRITICAL(&detectionMux);
 
-      computeMotionMetrics(gx_deg, gy_deg, gz_deg, ax_g, ay_g, az_g, currentRoll, currentPitch);
+      computeMotionMetrics(gx_deg, gy_deg, gz_deg, ax_g, ay_g, az_g, roll, pitch);
 
-      // Keep model feature order same as your previous implementation.
-      pushToBuffer(currentRoll, currentPitch, currentAccX, currentAccY, currentAccZ);
+      // O(1) now -- see pushToBuffer() above.
+      pushToBuffer(roll, pitch, ax_g, ay_g, az_g);
       runDetection();
     }
 
@@ -421,9 +522,8 @@ void initIMU() {
     return;
   }
 
-  if (xSemaphoreTake(i2cMutex, portMAX_DELAY)) {
+  if (xSemaphoreTake(i2cMutex, I2C_MUTEX_TIMEOUT_TICKS)) {
     imuReady = detectMPUAddress();
-
     if (!imuReady) {
       xSemaphoreGive(i2cMutex);
       Serial.println(">>> MPU6050 not found at 0x69 or 0x68.");
@@ -440,7 +540,6 @@ void initIMU() {
     i2cWriteRegister(0x1C, 0x00); // Accel ±2g
 
     Serial.println(">>> Calibrating gyro. Keep device still...");
-
     const int samples = 500;
     gyroX_bias = 0.0f;
     gyroY_bias = 0.0f;
@@ -464,6 +563,10 @@ void initIMU() {
     gyroZ_bias /= (float)samples;
 
     xSemaphoreGive(i2cMutex);
+  } else {
+    Serial.println(">>> IMU init failed: could not acquire I2C mutex.");
+    imuReady = false;
+    return;
   }
 
   Serial.println(">>> Gyro calibration complete.");
@@ -489,53 +592,88 @@ void initIMU() {
 }
 
 void tareIMU() {
+  portENTER_CRITICAL(&detectionMux);
   rollOffset = currentRoll;
   pitchOffset = currentPitch;
+  portEXIT_CRITICAL(&detectionMux);
   Serial.println(">>> IMU tare complete.");
 }
 
 float getRoll() {
-  return currentRoll - rollOffset;
+  portENTER_CRITICAL(&detectionMux);
+  float v = currentRoll - rollOffset;
+  portEXIT_CRITICAL(&detectionMux);
+  return v;
 }
 
 float getPitch() {
-  return currentPitch - pitchOffset;
+  portENTER_CRITICAL(&detectionMux);
+  float v = currentPitch - pitchOffset;
+  portEXIT_CRITICAL(&detectionMux);
+  return v;
 }
 
 float getAccX() {
-  return currentAccX;
+  portENTER_CRITICAL(&detectionMux);
+  float v = currentAccX;
+  portEXIT_CRITICAL(&detectionMux);
+  return v;
 }
 
 float getAccY() {
-  return currentAccY;
+  portENTER_CRITICAL(&detectionMux);
+  float v = currentAccY;
+  portEXIT_CRITICAL(&detectionMux);
+  return v;
 }
 
 float getAccZ() {
-  return currentAccZ;
+  portENTER_CRITICAL(&detectionMux);
+  float v = currentAccZ;
+  portEXIT_CRITICAL(&detectionMux);
+  return v;
 }
 
 int getSeismicClass() {
-  return predictedClass;
+  portENTER_CRITICAL(&detectionMux);
+  int v = predictedClass;
+  portEXIT_CRITICAL(&detectionMux);
+  return v;
 }
 
 float getSeismicConfidence() {
-  return predictionConfidence;
+  portENTER_CRITICAL(&detectionMux);
+  float v = predictionConfidence;
+  portEXIT_CRITICAL(&detectionMux);
+  return v;
 }
 
 float getMotionScore() {
-  return motionScore;
+  portENTER_CRITICAL(&detectionMux);
+  float v = motionScore;
+  portEXIT_CRITICAL(&detectionMux);
+  return v;
 }
 
 float getLinearAcceleration() {
-  return linearAcceleration;
+  portENTER_CRITICAL(&detectionMux);
+  float v = linearAcceleration;
+  portEXIT_CRITICAL(&detectionMux);
+  return v;
 }
 
 float getGyroMagnitude() {
-  return gyroMagnitude;
+  portENTER_CRITICAL(&detectionMux);
+  float v = gyroMagnitude;
+  portEXIT_CRITICAL(&detectionMux);
+  return v;
 }
 
 float getTiltMagnitude() {
-  return tiltMagnitude;
+  portENTER_CRITICAL(&detectionMux);
+  float v = tiltMagnitude;
+  portEXIT_CRITICAL(&detectionMux);
+  return v;
 }
 
 bool isAIModelReady() {
@@ -543,5 +681,8 @@ bool isAIModelReady() {
 }
 
 int getDetectionSource() {
-  return detectionSource;
+  portENTER_CRITICAL(&detectionMux);
+  int v = detectionSource;
+  portEXIT_CRITICAL(&detectionMux);
+  return v;
 }
