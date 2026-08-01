@@ -192,7 +192,7 @@ canvas.cube-canvas{display:block}
         <canvas id="fftCanvas" style="width:100%;height:100%;display:block"></canvas>
       </div>
 
-      <div id="panel-3d" style="display:none;flex:1;align-items:center;justify-content:center;background:var(--color-background-secondary);display:none">
+      <div id="panel-3d" style="display:none;flex:1;align-items:center;justify-content:center;background:var(--color-background-secondary);">
         <canvas id="cube3d" style="display:block;max-width:100%;max-height:100%"></canvas>
       </div>
 
@@ -238,9 +238,9 @@ canvas.cube-canvas{display:block}
         </div>
         <div id="calibStatus" style="font-size:11px;color:var(--color-text-secondary);margin-top:6px;min-height:16px"></div>
         <div style="margin-top:6px">
-          <div class="input-row"><label>ax scale</label><input type="number" id="scale_ax" value="1.0000" step="0.0001"></div>
-          <div class="input-row"><label>ay scale</label><input type="number" id="scale_ay" value="1.0000" step="0.0001"></div>
-          <div class="input-row"><label>az scale</label><input type="number" id="scale_az" value="1.0000" step="0.0001"></div>
+          <div class="input-row"><label>ax scale</label><input type="number" id="scale_ax" value="1.0000" step="0.0001" onchange="readCalibScales()"></div>
+          <div class="input-row"><label>ay scale</label><input type="number" id="scale_ay" value="1.0000" step="0.0001" onchange="readCalibScales()"></div>
+          <div class="input-row"><label>az scale</label><input type="number" id="scale_az" value="1.0000" step="0.0001" onchange="readCalibScales()"></div>
         </div>
       </div>
 
@@ -323,6 +323,7 @@ let recStartTime = null;
 let recTimerInterval = null;
 let simInterval = null;
 let serialReader = null;
+let serialPort = null;          // NEW: store port
 let bleDevice = null;
 let simT = 0;
 let calibOffsets = {ax:0,ay:0,az:0,gx:0,gy:0,gz:0};
@@ -344,32 +345,50 @@ let peakAx = 0, peakAz = 0;
 let sumAxSq=0,sumAySq=0,sumAzSq=0,statN=0;
 let pgaWindow = [];
 
+// ---------- Helper: power‑of‑two ----------
+function nextPowerOfTwo(n) {
+  return Math.pow(2, Math.floor(Math.log2(n)));
+}
+
+// ---------- Calibration scale reader ----------
+function readCalibScales() {
+  calibScales.ax = parseFloat(document.getElementById('scale_ax')?.value) || 1;
+  calibScales.ay = parseFloat(document.getElementById('scale_ay')?.value) || 1;
+  calibScales.az = parseFloat(document.getElementById('scale_az')?.value) || 1;
+}
+
+// ---------- Source / connection handling ----------
 function handleSourceChange(){
   const v = document.getElementById('sourceSelect').value;
   document.getElementById('portSelect').style.display = v==='serial'?'block':'none';
-  if(v==='sim'&&isConnected) disconnect();
+  if(v==='sim' && isConnected) disconnect();
 }
 
-function toggleConnect(){
-  if(isConnected) disconnect();
+async function toggleConnect(){
+  if(isConnected) await disconnect();
   else connect();
 }
 
 async function connect(){
   const src = document.getElementById('sourceSelect').value;
-  if(src==='sim'){
-    startSim();
-  } else if(src==='serial'){
-    await connectSerial();
-  } else if(src==='ble'){
-    await connectBLE();
-  }
+  if(src==='sim') startSim();
+  else if(src==='serial') await connectSerial();
+  else if(src==='ble') await connectBLE();
 }
 
-function disconnect(){
-  if(simInterval){clearInterval(simInterval);simInterval=null}
-  if(serialReader){try{serialReader.cancel()}catch(e){}}
-  if(bleDevice&&bleDevice.gatt&&bleDevice.gatt.connected) bleDevice.gatt.disconnect();
+async function disconnect(){
+  if(simInterval){ clearInterval(simInterval); simInterval = null; }
+  if(serialReader){
+    try{ await serialReader.cancel(); } catch(e){}
+    serialReader = null;
+  }
+  if(serialPort){
+    try{ await serialPort.close(); } catch(e){}
+    serialPort = null;
+  }
+  if(bleDevice && bleDevice.gatt && bleDevice.gatt.connected){
+    bleDevice.gatt.disconnect();
+  }
   setConnected(false);
 }
 
@@ -381,23 +400,23 @@ function setConnected(v){
   document.getElementById('connectBtn').className='btn'+(v?' danger':'');
 }
 
+// ---------- Simulation (raw data, calibration applied later) ----------
 function startSim(){
   setConnected(true);
   simT=0;
   simInterval=setInterval(()=>{
     simT+=0.01;
-    const quake = simT>30&&simT<55;
+    const quake = simT>30 && simT<55;
     const qScale = quake?Math.sin((simT-30)*0.5)*Math.min((simT-30)*0.1,1.0)*0.4:0;
-    const ax=(Math.sin(simT*2.1)*0.012+Math.random()*0.006-0.003+qScale*(Math.sin(simT*8.3)+Math.random()*.3))*calibScales.ax-calibOffsets.ax;
-    const ay=(Math.cos(simT*1.7)*0.008+Math.random()*0.006-0.003+qScale*(Math.cos(simT*9.1)+Math.random()*.3))*calibScales.ay-calibOffsets.ay;
-    const az=(1.0+Math.sin(simT*0.3)*0.002+Math.random()*0.003+qScale*0.3)*calibScales.az-calibOffsets.az;
-    const gxv=Math.sin(simT*1.1)*0.8+Math.random()*0.5-0.25+qScale*15*(Math.sin(simT*6));
-    const gyv=Math.cos(simT*0.9)*0.6+Math.random()*0.5-0.25+qScale*12*(Math.cos(simT*7));
-    const gzv=Math.sin(simT*0.4)*0.3+Math.random()*0.3-0.15+qScale*8;
-    const linAcc=Math.sqrt(ax*ax+ay*ay+(az-1)*(az-1));
-    const gyroMag=Math.sqrt(gxv*gxv+gyv*gyv+gzv*gzv);
-    const motionScore=Math.min(1,(linAcc/0.5*0.65+gyroMag/90*0.35));
-    // Simulate AI classification matching quake phase
+    const ax = Math.sin(simT*2.1)*0.012 + Math.random()*0.006 - 0.003 + qScale*(Math.sin(simT*8.3)+Math.random()*.3);
+    const ay = Math.cos(simT*1.7)*0.008 + Math.random()*0.006 - 0.003 + qScale*(Math.cos(simT*9.1)+Math.random()*.3);
+    const az = 1.0 + Math.sin(simT*0.3)*0.002 + Math.random()*0.003 + qScale*0.3;
+    const gxv = Math.sin(simT*1.1)*0.8 + Math.random()*0.5 - 0.25 + qScale*15*(Math.sin(simT*6));
+    const gyv = Math.cos(simT*0.9)*0.6 + Math.random()*0.5 - 0.25 + qScale*12*(Math.cos(simT*7));
+    const gzv = Math.sin(simT*0.4)*0.3 + Math.random()*0.3 - 0.15 + qScale*8;
+    const linAcc = Math.sqrt(ax*ax + ay*ay + (az-1)*(az-1));
+    const gyroMag = Math.sqrt(gxv*gxv + gyv*gyv + gzv*gzv);
+    const motionScore = Math.min(1, (linAcc/0.5*0.65 + gyroMag/90*0.35));
     let aiClass=0; let aiConf=0.92;
     if(quake){
       const phase=simT-30;
@@ -406,7 +425,7 @@ function startSim(){
       else{aiClass=2;aiConf=0.65+Math.random()*0.15;}
     }
     const sample={
-      ax,ay,az,gx:gxv,gy:gyv,gz:gzv,
+      ax, ay, az, gx:gxv, gy:gyv, gz:gzv,
       roll:Math.atan2(ay,az)*180/Math.PI,
       pitch:Math.atan2(-ax,Math.sqrt(ay*ay+az*az))*180/Math.PI,
       temp:25+Math.sin(simT*0.01)*0.5,
@@ -420,56 +439,87 @@ function startSim(){
   },10);
 }
 
+// ---------- Serial (raw data) ----------
 async function connectSerial(){
   if(!('serial' in navigator)){alert('Web Serial not supported in this browser. Use Chrome/Edge.');return}
   try{
-    const port=await navigator.serial.requestPort();
+    const port = await navigator.serial.requestPort();
     await port.open({baudRate:115200});
+    serialPort = port;
     setConnected(true);
-    const decoder=new TextDecoderStream();
-    port.readable.pipeTo(decoder.writable);
-    serialReader=decoder.readable.getReader();
-    let buf='';
+    const decoder = new TextDecoderStream();
+    port.readable.pipeTo(decoder.writable).catch(() => {});
+    serialReader = decoder.readable.getReader();
+    let buf = '';
     while(true){
-      const{value,done}=await serialReader.read();
-      if(done)break;
-      buf+=value;
-      const lines=buf.split('\n');
-      buf=lines.pop();
+      const {value, done} = await serialReader.read();
+      if(done) break;
+      buf += value;
+      const lines = buf.split('\n');
+      buf = lines.pop();
       for(const line of lines) parseLine(line.trim());
     }
-  }catch(e){if(e.name!=='NotFoundError')alert('Serial error: '+e.message)}
-  setConnected(false);
+  } catch(e){
+    if(e.name !== 'NotFoundError') alert('Serial error: ' + e.message);
+  } finally {
+    if(serialPort){
+      try{ await serialPort.close(); } catch(e){}
+      serialPort = null;
+    }
+    if(isConnected) setConnected(false);
+  }
 }
 
-// ── Unified line parser — handles both firmware serial formats ────────────────
-//
-// FORMAT A — firmware main.cpp Serial.print loop (space-separated key:value):
-//   R:0.0 P:0.0 Ax:0.00 Ay:0.00 Az:1.00 LinA:0.000 GMag:0.0 Motion:0.00
-//   Class:IDLE Conf:0% Src:WARM Pg:1 Pause:N
-//
-// FORMAT B — LOG mode CSV (sent when 'L' typed in serial monitor):
-//   ts_ms,ax,ay,az,gx,gy,gz,accelVib,gyroVib,stab,wafer,state
-//   (header lines start with #, skip them)
-//
-// FORMAT C — WASTP BLE CSV (from sendTelemetry()):
-//   state,pitch,roll,accelVib,gyroVib,stab,wafer,temp,pressure,compX,compY
-//
+// ---------- BLE (raw data) ----------
+async function connectBLE(){
+  if(!('bluetooth' in navigator)){alert('Web Bluetooth not supported in this browser. Use Chrome/Edge.');return}
+  try{
+    bleDevice = await navigator.bluetooth.requestDevice({
+      filters:[{name:'WASTP'},{namePrefix:'WASTP'},{namePrefix:'ESP32'},{namePrefix:'IMU'}],
+      optionalServices:[
+        '4fafc201-1fb5-459e-8fcc-c5c9c331914b',
+        '6e400001-b5a3-f393-e0a9-e50e24dcca9e'
+      ]
+    });
+    const server = await bleDevice.gatt.connect();
+    setConnected(true);
+    let char = null;
+    try{
+      const svc = await server.getPrimaryService('4fafc201-1fb5-459e-8fcc-c5c9c331914b');
+      char = await svc.getCharacteristic('beb5483e-36e1-4688-b7f5-ea07361b26a8');
+    }catch(e){
+      const svc = await server.getPrimaryService('6e400001-b5a3-f393-e0a9-e50e24dcca9e');
+      char = await svc.getCharacteristic('6e400003-b5a3-f393-e0a9-e50e24dcca9e');
+    }
+    let buf = '';
+    char.addEventListener('characteristicvaluechanged', e => {
+      buf += new TextDecoder().decode(e.target.value);
+      const lines = buf.split('\n'); buf = lines.pop();
+      for(const line of lines) parseLine(line.trim());
+    });
+    await char.startNotifications();
+    bleDevice.addEventListener('gattserverdisconnected', () => setConnected(false));
+  } catch(e){
+    if(e.name !== 'NotFoundError') alert('BLE error: ' + e.message);
+  }
+}
+
+// ---------- Unified line parser ----------
 function parseLine(line){
   if(!line || line.startsWith('#')) return;
 
-  // FORMAT A — key:value style (main loop Serial.print output)
+  // FORMAT A — key:value style
   if(line.includes('R:') && line.includes('Ax:')){
     const kv={};
     line.split(/\s+/).forEach(tok=>{
       const i=tok.indexOf(':');
-      if(i>0) kv[tok.slice(0,i)]=tok.slice(i+1);
+      if(i>0) kv[tok.slice(0,i)] = tok.slice(i+1);
     });
     const s={
       ax:parseFloat(kv['Ax'])||0,
       ay:parseFloat(kv['Ay'])||0,
       az:parseFloat(kv['Az'])||1,
-      gx:0, gy:0, gz:0,    // not in this format
+      gx:0, gy:0, gz:0,
       roll:parseFloat(kv['R'])||0,
       pitch:parseFloat(kv['P'])||0,
       linearAcc:parseFloat(kv['LinA'])||0,
@@ -510,7 +560,7 @@ function parseLine(line){
     return;
   }
 
-  // Fallback legacy: ts,ax,ay,az,gx,gy,gz (≥7 numeric fields)
+  // Fallback: ts,ax,ay,az,gx,gy,gz (≥7 numeric)
   if(p.length>=7 && !isNaN(+p[1])){
     ingestSample({ax:+p[1],ay:+p[2],az:+p[3],gx:+p[4],gy:+p[5],gz:+p[6]});
   }
@@ -525,539 +575,611 @@ function classNameToInt(name){
   }
 }
 
-async function connectBLE(){
-  if(!('bluetooth' in navigator)){alert('Web Bluetooth not supported in this browser. Use Chrome/Edge.');return}
-  try{
-    bleDevice=await navigator.bluetooth.requestDevice({
-      // WASTP firmware advertises name "WASTP"
-      filters:[{name:'WASTP'},{namePrefix:'WASTP'},{namePrefix:'ESP32'},{namePrefix:'IMU'}],
-      optionalServices:[
-        '4fafc201-1fb5-459e-8fcc-c5c9c331914b',  // WASTP SERVICE_UUID
-        '6e400001-b5a3-f393-e0a9-e50e24dcca9e'   // fallback NUS
-      ]
-    });
-    const server=await bleDevice.gatt.connect();
-    setConnected(true);
-    // Try WASTP service first, fall back to NUS
-    let char=null;
-    try{
-      const svc=await server.getPrimaryService('4fafc201-1fb5-459e-8fcc-c5c9c331914b');
-      char=await svc.getCharacteristic('beb5483e-36e1-4688-b7f5-ea07361b26a8');
-    }catch(e){
-      const svc=await server.getPrimaryService('6e400001-b5a3-f393-e0a9-e50e24dcca9e');
-      char=await svc.getCharacteristic('6e400003-b5a3-f393-e0a9-e50e24dcca9e');
-    }
-    let buf='';
-    char.addEventListener('characteristicvaluechanged',e=>{
-      buf+=new TextDecoder().decode(e.target.value);
-      const lines=buf.split('\n');buf=lines.pop();
-      for(const line of lines) parseLine(line.trim());
-    });
-    await char.startNotifications();
-    bleDevice.addEventListener('gattserverdisconnected',()=>setConnected(false));
-  }catch(e){if(e.name!=='NotFoundError')alert('BLE error: '+e.message)}
-}
-
-function ingestSample(s){
-  const now=Date.now();
+// ---------- Core: ingest sample, apply calibration ----------
+function ingestSample(raw){
+  const now = Date.now();
   sampleCount++;
   sampleRateBuffer.push(now);
-  if(sampleRateBuffer.length>100) sampleRateBuffer.shift();
+  if(sampleRateBuffer.length > 100) sampleRateBuffer.shift();
 
-  for(const k of['ax','ay','az','gx','gy','gz']){
-    history[k].push(s[k]??0);
-    if(history[k].length>HISTORY_MAX) history[k].shift();
+  // Store raw samples for calibration
+  if(isCalibrating){
+    calibSamples.push({...raw});
+  }
+
+  // Apply calibration to a working copy (skip if calibrating)
+  const s = isCalibrating ? raw : {
+    ...raw,
+    ax: raw.ax * calibScales.ax - calibOffsets.ax,
+    ay: raw.ay * calibScales.ay - calibOffsets.ay,
+    az: raw.az * calibScales.az - calibOffsets.az,
+    gx: (raw.gx ?? 0) - calibOffsets.gx,
+    gy: (raw.gy ?? 0) - calibOffsets.gy,
+    gz: (raw.gz ?? 0) - calibOffsets.gz,
+  };
+
+  for(const k of ['ax','ay','az','gx','gy','gz']){
+    history[k].push(s[k] ?? 0);
+    if(history[k].length > HISTORY_MAX) history[k].shift();
   }
   history.t.push(now);
-  if(history.t.length>HISTORY_MAX) history.t.shift();
+  if(history.t.length > HISTORY_MAX) history.t.shift();
 
-  if(isRecording) recording.push({...s,t:now});
-  if(isCalibrating) calibSamples.push(s);
+  if(isRecording) recording.push({...s, t: now});
 
-  updateMetrics(s,now);
+  updateMetrics(s, now);
   updateAIClassification(s);
   updateCubeTarget(s);
 }
 
-function updateMetrics(s,now){
-  document.getElementById('v_ax').textContent=s.ax.toFixed(4);
-  document.getElementById('v_ay').textContent=s.ay.toFixed(4);
-  document.getElementById('v_az').textContent=s.az.toFixed(4);
-  document.getElementById('v_gx').textContent=s.gx?.toFixed(3)??'—';
-  document.getElementById('v_gy').textContent=s.gy?.toFixed(3)??'—';
-  document.getElementById('v_gz').textContent=s.gz?.toFixed(3)??'—';
-  if(s.temp!=null||s.tempC!=null) document.getElementById('v_temp').textContent=(s.tempC??s.temp??0).toFixed(1);
-  const mag=Math.sqrt(s.ax*s.ax+s.ay*s.ay+s.az*s.az);
-  document.getElementById('v_mag').textContent=mag.toFixed(4);
-  // Firmware-specific derived fields
-  if(s.linearAcc!=null) document.getElementById('v_linacc').textContent=s.linearAcc.toFixed(3);
-  if(s.gyroMag!=null)   document.getElementById('v_gyromag').textContent=s.gyroMag.toFixed(1);
-  if(s.motionScore!=null) document.getElementById('v_motion').textContent=s.motionScore.toFixed(2);
-  if(s.tiltMag!=null)   document.getElementById('v_tiltmag').textContent=s.tiltMag.toFixed(1);
-  const uptimeSec=Math.floor((now-uptimeStart)/1000);
-  document.getElementById('v_uptime').textContent=uptimeSec+'s';
-  if(sampleRateBuffer.length>10){
-    const dt=(now-sampleRateBuffer[0])/(sampleRateBuffer.length-1);
-    document.getElementById('v_rate').textContent=dt>0?Math.round(1000/dt):'—';
+// ---------- UI updates ----------
+function updateMetrics(s, now){
+  document.getElementById('v_ax').textContent = s.ax.toFixed(4);
+  document.getElementById('v_ay').textContent = s.ay.toFixed(4);
+  document.getElementById('v_az').textContent = s.az.toFixed(4);
+  document.getElementById('v_gx').textContent = (s.gx??0).toFixed(3);
+  document.getElementById('v_gy').textContent = (s.gy??0).toFixed(3);
+  document.getElementById('v_gz').textContent = (s.gz??0).toFixed(3);
+  if(s.temp != null || s.tempC != null) document.getElementById('v_temp').textContent = (s.tempC??s.temp??0).toFixed(1);
+  const mag = Math.sqrt(s.ax*s.ax + s.ay*s.ay + s.az*s.az);
+  document.getElementById('v_mag').textContent = mag.toFixed(4);
+  if(s.linearAcc != null) document.getElementById('v_linacc').textContent = s.linearAcc.toFixed(3);
+  if(s.gyroMag != null)   document.getElementById('v_gyromag').textContent = s.gyroMag.toFixed(1);
+  if(s.motionScore != null) document.getElementById('v_motion').textContent = s.motionScore.toFixed(2);
+  if(s.tiltMag != null)   document.getElementById('v_tiltmag').textContent = s.tiltMag.toFixed(1);
+  const uptimeSec = Math.floor((now - uptimeStart)/1000);
+  document.getElementById('v_uptime').textContent = uptimeSec+'s';
+  if(sampleRateBuffer.length > 10){
+    const dt = (now - sampleRateBuffer[0]) / (sampleRateBuffer.length - 1);
+    document.getElementById('v_rate').textContent = dt>0 ? Math.round(1000/dt) : '—';
   }
-  // Use firmware roll/pitch if available, else compute from accel
-  const roll  = s.roll  != null ? s.roll  : Math.atan2(s.ay,s.az)*180/Math.PI;
-  const pitch = s.pitch != null ? s.pitch : Math.atan2(-s.ax,Math.sqrt(s.ay*s.ay+s.az*s.az))*180/Math.PI;
-  document.getElementById('v_roll').textContent=roll.toFixed(1)+'°';
-  document.getElementById('v_pitch').textContent=pitch.toFixed(1)+'°';
-  document.getElementById('v_yaw').textContent='—';
 
-  ['ax','ay','az','gx','gy','gz'].forEach(k=>{
-    const v=s[k]??0; const range=CHANNELS[k].range;
-    const pct=Math.min(100,Math.max(0,(v/range+1)/2*100));
-    document.getElementById('b_'+k).style.width=pct+'%';
+  const roll  = s.roll  != null ? s.roll  : Math.atan2(s.ay, s.az)*180/Math.PI;
+  const pitch = s.pitch != null ? s.pitch : Math.atan2(-s.ax, Math.sqrt(s.ay*s.ay + s.az*s.az))*180/Math.PI;
+  document.getElementById('v_roll').textContent = roll.toFixed(1)+'°';
+  document.getElementById('v_pitch').textContent = pitch.toFixed(1)+'°';
+  document.getElementById('v_yaw').textContent = '—';
+
+  ['ax','ay','az','gx','gy','gz'].forEach(k => {
+    const v = s[k]??0; const range = CHANNELS[k].range;
+    const pct = Math.min(100, Math.max(0, (v/range + 1)/2*100));
+    document.getElementById('b_'+k).style.width = pct+'%';
   });
 
-  sumAxSq+=s.ax*s.ax; sumAySq+=s.ay*s.ay; sumAzSq+=s.az*s.az; statN++;
-  if(Math.abs(s.ax)>Math.abs(peakAx)) peakAx=s.ax;
-  if(Math.abs(s.az)>Math.abs(peakAz)) peakAz=s.az;
-  if(statN%50===0){
-    document.getElementById('s_ax_rms').textContent=Math.sqrt(sumAxSq/statN).toFixed(4);
-    document.getElementById('s_ay_rms').textContent=Math.sqrt(sumAySq/statN).toFixed(4);
-    document.getElementById('s_az_rms').textContent=Math.sqrt(sumAzSq/statN).toFixed(4);
-    document.getElementById('s_ax_pk').textContent=peakAx.toFixed(4);
-    document.getElementById('s_az_pk').textContent=peakAz.toFixed(4);
-    document.getElementById('s_recn').textContent=recording.length;
+  sumAxSq += s.ax*s.ax; sumAySq += s.ay*s.ay; sumAzSq += s.az*s.az; statN++;
+  if(Math.abs(s.ax) > Math.abs(peakAx)) peakAx = s.ax;
+  if(Math.abs(s.az) > Math.abs(peakAz)) peakAz = s.az;
+  if(statN % 50 === 0){
+    document.getElementById('s_ax_rms').textContent = Math.sqrt(sumAxSq/statN).toFixed(4);
+    document.getElementById('s_ay_rms').textContent = Math.sqrt(sumAySq/statN).toFixed(4);
+    document.getElementById('s_az_rms').textContent = Math.sqrt(sumAzSq/statN).toFixed(4);
+    document.getElementById('s_ax_pk').textContent = peakAx.toFixed(4);
+    document.getElementById('s_az_pk').textContent = peakAz.toFixed(4);
+    document.getElementById('s_recn').textContent = recording.length;
   }
 }
 
-// ── updateAIClassification ────────────────────────────────────────────────────
-// Uses firmware aiClass (0=IDLE,1=TREMOR,2=LANDSLIDE,3=SEISMIC) + aiConfidence
-// when available; falls back to PGA-based heuristic for simulation/legacy data.
 function updateAIClassification(s){
-  const mag=Math.sqrt(s.ax*s.ax+s.ay*s.ay+(s.az-1)*(s.az-1));
+  const mag = Math.sqrt(s.ax*s.ax + s.ay*s.ay + (s.az-1)*(s.az-1));
   pgaWindow.push(mag); if(pgaWindow.length>500) pgaWindow.shift();
-  const pga=Math.max(...pgaWindow);
-  document.getElementById('v_pga').textContent=pga.toFixed(4);
+  const pga = Math.max(...pgaWindow);
+  document.getElementById('v_pga').textContent = pga.toFixed(4);
 
-  // Seismic intensity bar (PGA-based, always updated)
-  const pct=Math.min(100,pga/0.5*100);
-  document.getElementById('seismicFill').style.width=pct+'%';
+  const pct = Math.min(100, pga/0.5*100);
+  document.getElementById('seismicFill').style.width = pct+'%';
 
-  // Determine class + confidence — use firmware values if present
   let cls  = s.aiClass      != null ? s.aiClass      : (pga>0.05?2:pga>0.01?1:0);
   let conf = s.aiConfidence != null ? s.aiConfidence  : Math.min(1, pga/0.05);
   let src  = s.detectionSource || '—';
 
-  // Class label + colours
   const CLASS_META=[
     {label:'IDLE',      badge:'alert-ok',     badgeText:'OK',       alert:'None',    fill:'#639922', sfill:'#639922'},
     {label:'TREMOR',    badge:'alert-warn',   badgeText:'TREMOR',   alert:'Minor',   fill:'#ba7517', sfill:'#ba7517'},
     {label:'LANDSLIDE', badge:'alert-danger', badgeText:'LANDSLIDE',alert:'MODERATE',fill:'#d85a30', sfill:'#d85a30'},
     {label:'SEISMIC',   badge:'alert-danger', badgeText:'SEISMIC',  alert:'STRONG',  fill:'#e24b4a', sfill:'#e24b4a'},
   ];
-  const meta=CLASS_META[cls]||CLASS_META[0];
+  const meta = CLASS_META[cls] || CLASS_META[0];
 
-  document.getElementById('v_classLabel').textContent=meta.label;
-  document.getElementById('v_classLabel').style.color=meta.sfill;
+  document.getElementById('v_classLabel').textContent = meta.label;
+  document.getElementById('v_classLabel').style.color = meta.sfill;
+  const badge = document.getElementById('seismicBadge');
+  badge.className = 'alert-badge '+meta.badge;
+  badge.textContent = meta.badgeText;
+  document.getElementById('v_alert').textContent = meta.alert;
+  document.getElementById('seismicFill').style.background = meta.sfill;
 
-  const badge=document.getElementById('seismicBadge');
-  badge.className='alert-badge '+meta.badge;
-  badge.textContent=meta.badgeText;
+  const confPct = (conf*100).toFixed(0);
+  document.getElementById('confBar').style.width = confPct+'%';
+  document.getElementById('confBar').style.background = meta.sfill;
+  document.getElementById('v_conf').textContent = confPct+'%';
 
-  document.getElementById('v_alert').textContent=meta.alert;
-  document.getElementById('seismicFill').style.background=meta.sfill;
-
-  // Confidence bar
-  const confPct=(conf*100).toFixed(0);
-  document.getElementById('confBar').style.width=confPct+'%';
-  document.getElementById('confBar').style.background=meta.sfill;
-  document.getElementById('v_conf').textContent=confPct+'%';
-
-  // AI ready
   document.getElementById('v_aiready').textContent = s.aiReady!=null ? (s.aiReady?'YES':'NO') : '—';
 
-  // Source badge
-  const pb=document.getElementById('phaseBadge');
-  const srcMeta={
+  const pb = document.getElementById('phaseBadge');
+  const srcMeta = {
     MODEL:   {bg:'#e6f1fb',col:'#185fa5'},
     RULE:    {bg:'#faeeda',col:'#854f0b'},
     OVERRIDE:{bg:'#fcebeb',col:'#a32d2d'},
     WARM:    {bg:'#f5f5f2',col:'#666'},
     BLE:     {bg:'#e6f1fb',col:'#185fa5'},
     LOG:     {bg:'#f5f5f2',col:'#666'},
-  }[src.toUpperCase()]||{bg:'#f5f5f2',col:'#666'};
-  pb.textContent=src;
-  pb.style.background=srcMeta.bg;
-  pb.style.color=srcMeta.col;
+  }[src.toUpperCase()] || {bg:'#f5f5f2',col:'#666'};
+  pb.textContent = src;
+  pb.style.background = srcMeta.bg;
+  pb.style.color = srcMeta.col;
 
-  // Class likelihood mini-bars: set active class to confidence, others get inverse share
-  const ids=['cl_idle','cl_tremor','cl_land','cl_seis'];
-  const remaining=(1-conf)/3;
+  const ids = ['cl_idle','cl_tremor','cl_land','cl_seis'];
+  const remaining = (1 - conf) / 3;
   ids.forEach((id,i)=>{
-    const pct2=i===cls?conf*100:remaining*100;
-    document.getElementById(id).style.width=Math.max(1,pct2).toFixed(1)+'%';
+    const pct2 = i===cls ? conf*100 : remaining*100;
+    document.getElementById(id).style.width = Math.max(1, pct2).toFixed(1)+'%';
   });
 }
 
 function updateCubeTarget(s){
-  targetAngles.x=Math.atan2(s.ay,s.az);
-  targetAngles.y=Math.atan2(-s.ax,Math.sqrt(s.ay*s.ay+s.az*s.az));
-  targetAngles.z+=(s.gz??0)*0.01*Math.PI/180;
+  targetAngles.x = Math.atan2(s.ay, s.az);
+  targetAngles.y = Math.atan2(-s.ax, Math.sqrt(s.ay*s.ay + s.az*s.az));
+  targetAngles.z += (s.gz??0) * 0.01 * Math.PI/180;
 }
 
+// ---------- Calibration ----------
+function startCalibration(){
+  readCalibScales();
+  calibSamples = [];
+  isCalibrating = true;
+  document.getElementById('calibStatus').textContent = 'Hold still for 2 seconds…';
+  setTimeout(() => {
+    isCalibrating = false;
+    if(calibSamples.length < 10){
+      document.getElementById('calibStatus').textContent = 'Not enough samples';
+      return;
+    }
+    calibOffsets.ax = calibSamples.reduce((s,r) => s + r.ax, 0) / calibSamples.length;
+    calibOffsets.ay = calibSamples.reduce((s,r) => s + r.ay, 0) / calibSamples.length;
+    calibOffsets.az = calibSamples.reduce((s,r) => s + r.az, 0) / calibSamples.length - 1;
+    calibOffsets.gx = calibSamples.reduce((s,r) => s + (r.gx ?? 0), 0) / calibSamples.length;
+    calibOffsets.gy = calibSamples.reduce((s,r) => s + (r.gy ?? 0), 0) / calibSamples.length;
+    calibOffsets.gz = calibSamples.reduce((s,r) => s + (r.gz ?? 0), 0) / calibSamples.length;
+    document.getElementById('c_ax').textContent = calibOffsets.ax.toFixed(4);
+    document.getElementById('c_ay').textContent = calibOffsets.ay.toFixed(4);
+    document.getElementById('c_az').textContent = calibOffsets.az.toFixed(4);
+    document.getElementById('c_gx').textContent = calibOffsets.gx.toFixed(3);
+    document.getElementById('c_gy').textContent = calibOffsets.gy.toFixed(3);
+    document.getElementById('c_gz').textContent = calibOffsets.gz.toFixed(3);
+    document.getElementById('calibStatus').textContent = 'Calibrated from '+calibSamples.length+' samples';
+  }, 2000);
+}
+
+function resetCalibration(){
+  calibOffsets = {ax:0, ay:0, az:0, gx:0, gy:0, gz:0};
+  calibScales = {ax:1, ay:1, az:1};
+  document.getElementById('scale_ax').value = '1.0000';
+  document.getElementById('scale_ay').value = '1.0000';
+  document.getElementById('scale_az').value = '1.0000';
+  document.getElementById('c_ax').textContent = '0.000';
+  document.getElementById('c_ay').textContent = '0.000';
+  document.getElementById('c_az').textContent = '0.000';
+  document.getElementById('c_gx').textContent = '0.000';
+  document.getElementById('c_gy').textContent = '0.000';
+  document.getElementById('c_gz').textContent = '0.000';
+  document.getElementById('calibStatus').textContent = 'Offsets cleared';
+}
+
+// ---------- Recording ----------
 function toggleRecord(){
   if(isRecording){
-    isRecording=false;
+    isRecording = false;
     clearInterval(recTimerInterval);
-    document.getElementById('recordBtn').className='btn';
-    document.getElementById('recordBtn').innerHTML='<i class="ti ti-player-record" aria-hidden="true"></i> Record';
-    document.getElementById('recIndicator').style.display='none';
-    document.getElementById('exportInfo').textContent=recording.length+' samples recorded';
+    document.getElementById('recordBtn').className = 'btn';
+    document.getElementById('recordBtn').innerHTML = '<i class="ti ti-player-record" aria-hidden="true"></i> Record';
+    document.getElementById('recIndicator').style.display = 'none';
+    document.getElementById('exportInfo').textContent = recording.length+' samples recorded';
     buildReplayCanvas();
-  }else{
-    isRecording=true;
-    recStartTime=Date.now();
-    document.getElementById('recordBtn').className='btn danger';
-    document.getElementById('recordBtn').innerHTML='<i class="ti ti-player-stop" aria-hidden="true"></i> Stop';
-    document.getElementById('recIndicator').style.display='flex';
-    recTimerInterval=setInterval(()=>{
-      document.getElementById('recTime').textContent=Math.floor((Date.now()-recStartTime)/1000)+'s';
-    },1000);
+  } else {
+    isRecording = true;
+    recStartTime = Date.now();
+    document.getElementById('recordBtn').className = 'btn danger';
+    document.getElementById('recordBtn').innerHTML = '<i class="ti ti-player-stop" aria-hidden="true"></i> Stop';
+    document.getElementById('recIndicator').style.display = 'flex';
+    recTimerInterval = setInterval(() => {
+      document.getElementById('recTime').textContent = Math.floor((Date.now() - recStartTime)/1000)+'s';
+    }, 1000);
   }
 }
 
 function clearRecording(){
-  recording=[];
-  document.getElementById('exportInfo').textContent='No recording';
-  document.getElementById('s_recn').textContent='0';
-  document.getElementById('replayEmpty').style.display='block';
-  document.getElementById('replayCanvas').style.display='none';
-  replayIdx=0;
-  document.getElementById('replaySlider').value=0;
-  document.getElementById('replayPos').textContent='0 / 0 samples';
+  if(isRecording) toggleRecord();
+  recording = [];
+  document.getElementById('exportInfo').textContent = 'No recording';
+  document.getElementById('s_recn').textContent = '0';
+  document.getElementById('replayEmpty').style.display = 'block';
+  document.getElementById('replayCanvas').style.display = 'none';
+  replayIdx = 0;
+  document.getElementById('replaySlider').value = 0;
+  document.getElementById('replayPos').textContent = '0 / 0 samples';
 }
 
+// ---------- Export ----------
 function exportData(){
   if(recording.length===0){alert('No recording to export.');return}
-  const header='timestamp_ms,ax,ay,az,gx,gy,gz,roll,pitch,linearAcc,gyroMag,motionScore,aiClass,aiConfidence,detectionSource,temp\n';
-  const rows=recording.map(r=>[
+  const header = 'timestamp_ms,ax,ay,az,gx,gy,gz,roll,pitch,linearAcc,gyroMag,motionScore,aiClass,aiConfidence,detectionSource,temp\n';
+  const rows = recording.map(r => [
     r.t,
-    (r.ax??0).toFixed(6),(r.ay??0).toFixed(6),(r.az??0).toFixed(6),
-    (r.gx??0).toFixed(4),(r.gy??0).toFixed(4),(r.gz??0).toFixed(4),
-    (r.roll??0).toFixed(2),(r.pitch??0).toFixed(2),
-    (r.linearAcc??0).toFixed(4),(r.gyroMag??0).toFixed(3),
+    (r.ax??0).toFixed(6), (r.ay??0).toFixed(6), (r.az??0).toFixed(6),
+    (r.gx??0).toFixed(4), (r.gy??0).toFixed(4), (r.gz??0).toFixed(4),
+    (r.roll??0).toFixed(2), (r.pitch??0).toFixed(2),
+    (r.linearAcc??0).toFixed(4), (r.gyroMag??0).toFixed(3),
     (r.motionScore??0).toFixed(4),
     r.aiClass??0,
     (r.aiConfidence??0).toFixed(3),
     r.detectionSource??'',
     (r.temp??r.tempC??0).toFixed(1),
   ].join(',')).join('\n');
-  download('seismic_recording.csv',header+rows,'text/csv');
+  download('seismic_recording.csv', header+rows, 'text/csv');
 }
 
 function exportJSON(){
   if(recording.length===0){alert('No recording to export.');return}
-  download('imu_recording.json',JSON.stringify(recording,null,2),'application/json');
+  download('imu_recording.json', JSON.stringify(recording,null,2), 'application/json');
 }
 
-function download(name,content,type){
-  const a=document.createElement('a');
-  a.href=URL.createObjectURL(new Blob([content],{type}));
-  a.download=name;a.click();
+function download(name, content, type){
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([content], {type}));
+  a.download = name; a.click();
 }
 
-function startCalibration(){
-  calibSamples=[];isCalibrating=true;
-  document.getElementById('calibStatus').textContent='Hold still for 2 seconds…';
-  setTimeout(()=>{
-    isCalibrating=false;
-    if(calibSamples.length<10){document.getElementById('calibStatus').textContent='Not enough samples';return}
-    calibOffsets.ax=calibSamples.reduce((s,r)=>s+r.ax,0)/calibSamples.length;
-    calibOffsets.ay=calibSamples.reduce((s,r)=>s+r.ay,0)/calibSamples.length;
-    calibOffsets.az=calibSamples.reduce((s,r)=>s+r.az,0)/calibSamples.length-1;
-    calibOffsets.gx=calibSamples.reduce((s,r)=>s+(r.gx??0),0)/calibSamples.length;
-    calibOffsets.gy=calibSamples.reduce((s,r)=>s+(r.gy??0),0)/calibSamples.length;
-    calibOffsets.gz=calibSamples.reduce((s,r)=>s+(r.gz??0),0)/calibSamples.length;
-    document.getElementById('c_ax').textContent=calibOffsets.ax.toFixed(4);
-    document.getElementById('c_ay').textContent=calibOffsets.ay.toFixed(4);
-    document.getElementById('c_az').textContent=calibOffsets.az.toFixed(4);
-    document.getElementById('c_gx').textContent=calibOffsets.gx.toFixed(3);
-    document.getElementById('c_gy').textContent=calibOffsets.gy.toFixed(3);
-    document.getElementById('c_gz').textContent=calibOffsets.gz.toFixed(3);
-    document.getElementById('calibStatus').textContent='Calibrated from '+calibSamples.length+' samples';
-  },2000);
-}
-
-function resetCalibration(){
-  calibOffsets={ax:0,ay:0,az:0,gx:0,gy:0,gz:0};
-  calibScales={ax:1,ay:1,az:1};
-  ['ax','ay','az','gx','gy','gz'].forEach(k=>document.getElementById('c_'+k).textContent='0.000');
-  document.getElementById('calibStatus').textContent='Offsets cleared';
-}
-
+// ---------- Oscilloscope controls ----------
 function toggleCh(ch){
-  CHANNELS_ACTIVE[ch]=!CHANNELS_ACTIVE[ch];
-  document.getElementById('ch_'+ch).className='btn'+(CHANNELS_ACTIVE[ch]?' active':'');
-  document.getElementById('osc_'+ch+'_row').style.display=CHANNELS_ACTIVE[ch]?'':'none';
+  CHANNELS_ACTIVE[ch] = !CHANNELS_ACTIVE[ch];
+  document.getElementById('ch_'+ch).className = 'btn' + (CHANNELS_ACTIVE[ch] ? ' active' : '');
+  document.getElementById('osc_'+ch+'_row').style.display = CHANNELS_ACTIVE[ch] ? '' : 'none';
 }
 
 function updateOscWindow(){
-  OSC_WINDOW=parseInt(document.getElementById('oscWindow').value);
+  OSC_WINDOW = parseInt(document.getElementById('oscWindow').value);
 }
 
+// ---------- Tab switching ----------
 function switchTab(tab){
-  currentTab=tab;
-  ['osc','fft','3d','replay'].forEach(t=>{
-    const el=document.getElementById('panel-'+t);
-    if(el) el.style.display=(t===tab)?'flex':'none';
-    document.getElementById('tab-'+t).className='tab'+(t===tab?' active':'');
+  currentTab = tab;
+  ['osc','fft','3d','replay'].forEach(t => {
+    const el = document.getElementById('panel-'+t);
+    if(el) el.style.display = (t === tab) ? 'flex' : 'none';
+    document.getElementById('tab-'+t).className = 'tab' + (t===tab ? ' active' : '');
   });
-  if(tab==='3d') requestAnimationFrame(draw3dFull);
+  if(tab === '3d') requestAnimationFrame(draw3dFull);
+}
+
+// ---------- Replay ----------
+function renderReplayFrame(){
+  if(recording.length === 0) return;
+  const idx = Math.min(replayIdx, recording.length - 1);
+  const s = recording[idx];
+  if(!s) return;
+
+  updateMetrics(s, s.t || Date.now());
+  updateAIClassification(s);
+  updateCubeTarget(s);
+
+  const canvas = document.getElementById('replayCanvas');
+  if(!canvas || canvas.style.display === 'none') return;
+  const ctx = canvas.getContext('2d');
+  const w = canvas.width, h = canvas.height;
+  // redraw static traces
+  ctx.fillStyle = isDark ? '#1a1a1a' : '#f5f5f2';
+  ctx.fillRect(0, 0, w, h);
+  ['ax','az'].forEach(k => {
+    ctx.beginPath();
+    const col = k === 'ax' ? '#378add' : '#d85a30';
+    ctx.strokeStyle = col;
+    ctx.lineWidth = 1.5;
+    for(let i = 0; i < recording.length; i++){
+      const x = i / recording.length * w;
+      const v = recording[i][k];
+      const y = h/2 - v/2 * h/2;
+      i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+  });
+  // cursor
+  const cx = idx / recording.length * w;
+  ctx.strokeStyle = '#185fa5';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(cx, 0);
+  ctx.lineTo(cx, h);
+  ctx.stroke();
+}
+
+function buildReplayCanvas(){
+  if(recording.length === 0) return;
+  document.getElementById('replayEmpty').style.display = 'none';
+  const canvas = document.getElementById('replayCanvas');
+  canvas.style.display = 'block';
+  canvas.width = canvas.offsetWidth || 600;
+  canvas.height = 200;
+  renderReplayFrame(); // draw static traces + cursor
 }
 
 function toggleReplay(){
-  if(recording.length===0)return;
-  replayPlaying=!replayPlaying;
-  document.getElementById('replayPlayBtn').innerHTML=replayPlaying?'<i class="ti ti-player-pause"></i>':'<i class="ti ti-player-play"></i>';
+  if(recording.length === 0) return;
+  replayPlaying = !replayPlaying;
+  document.getElementById('replayPlayBtn').innerHTML = replayPlaying ? '<i class="ti ti-player-pause"></i>' : '<i class="ti ti-player-play"></i>';
   if(replayPlaying){
-    if(replayIdx>=recording.length) replayIdx=0;
-    replayInterval=setInterval(()=>{
-      if(replayIdx>=recording.length){replayPlaying=false;clearInterval(replayInterval);return}
-      document.getElementById('replaySlider').value=Math.round(replayIdx/recording.length*100);
-      document.getElementById('replayPos').textContent=replayIdx+' / '+recording.length;
-      replayIdx+=5;
-    },50);
-  }else{
+    if(replayIdx >= recording.length) replayIdx = 0;
+    // estimate sample interval from recording timestamps
+    let interval = 10;
+    if(recording.length > 2){
+      const dt = (recording[recording.length-1].t - recording[0].t) / (recording.length - 1);
+      if(dt > 0 && dt < 1000) interval = Math.max(5, Math.round(dt));
+    }
+    replayInterval = setInterval(() => {
+      if(replayIdx >= recording.length){
+        replayPlaying = false;
+        clearInterval(replayInterval);
+        document.getElementById('replayPlayBtn').innerHTML = '<i class="ti ti-player-play"></i>';
+        return;
+      }
+      document.getElementById('replaySlider').value = Math.round(replayIdx / recording.length * 100);
+      document.getElementById('replayPos').textContent = replayIdx + ' / ' + recording.length;
+      renderReplayFrame();
+      replayIdx++;
+    }, interval);
+  } else {
     clearInterval(replayInterval);
   }
 }
 
 function seekReplay(pct){
-  replayIdx=Math.floor(pct/100*recording.length);
-  document.getElementById('replayPos').textContent=replayIdx+' / '+recording.length;
+  replayIdx = Math.floor(pct/100 * recording.length);
+  document.getElementById('replayPos').textContent = replayIdx + ' / ' + recording.length;
+  if(!replayPlaying && recording[replayIdx]){
+    renderReplayFrame();
+  }
 }
 
-function buildReplayCanvas(){
-  if(recording.length===0)return;
-  document.getElementById('replayEmpty').style.display='none';
-  const canvas=document.getElementById('replayCanvas');
-  canvas.style.display='block';
-  canvas.width=canvas.offsetWidth||600;canvas.height=200;
-  const ctx=canvas.getContext('2d');
-  const w=canvas.width,h=canvas.height;
-  ctx.fillStyle=isDark?'#1a1a1a':'#f5f5f2';ctx.fillRect(0,0,w,h);
-  ['ax','az'].forEach((k,ki)=>{
+// ---------- 3D Cube drawing ----------
+function drawCubeOnCanvas(canvas, size, showLabels){
+  const ctx = canvas.getContext('2d');
+  const w = canvas.width, h = canvas.height;
+  ctx.clearRect(0, 0, w, h);
+
+  const cx = w/2, cy = h/2;
+  const rx = cubeAngles.x, ry = cubeAngles.y, rz = cubeAngles.z;
+
+  function rotVert(v){
+    let [x, y, z] = v;
+    let y2 = y*Math.cos(rx) - z*Math.sin(rx), z2 = y*Math.sin(rx) + z*Math.cos(rx);
+    y = y2; z = z2;
+    let x2 = x*Math.cos(ry) + z2*Math.sin(ry), z3 = -x*Math.sin(ry) + z2*Math.cos(ry);
+    x = x2; z = z3;
+    let x3 = x2*Math.cos(rz) - y*Math.sin(rz), y3 = x2*Math.sin(rz) + y*Math.cos(rz);
+    const sc = 280/(280 + z);
+    return [cx + x3*size*sc, cy - y3*size*sc, z];
+  }
+
+  const verts = [[-1,-1,-1],[1,-1,-1],[1,1,-1],[-1,1,-1],[-1,-1,1],[1,-1,1],[1,1,1],[-1,1,1]];
+  const faces = [[0,1,2,3],[4,5,6,7],[0,1,5,4],[2,3,7,6],[0,3,7,4],[1,2,6,5]];
+  const faceColors = isDark ?
+    ['#1d4670','#1d3b30','#5a2a1a','#2d1f60','#5a1a30','#4a3010'] :
+    ['#b5d4f4','#9fe1cb','#f5c4b3','#cecbf6','#f4c0d1','#fac775'];
+  const labels = ['X','X','Z','Z','Y','Y'];
+
+  const projected = verts.map(v => rotVert(v));
+  const facesWithZ = faces.map((f, i) => {
+    const z = f.reduce((s, vi) => s + projected[vi][2], 0)/4;
+    return {f, i, z};
+  }).sort((a,b) => a.z - b.z);
+
+  facesWithZ.forEach(({f, i}) => {
+    const pts = f.map(vi => projected[vi]);
     ctx.beginPath();
-    const col=k==='ax'?'#378add':'#d85a30';
-    ctx.strokeStyle=col;ctx.lineWidth=1.5;
-    for(let i=0;i<recording.length;i++){
-      const x=i/recording.length*w;
-      const v=recording[i][k];
-      const y=h/2-v/2*h/2;
-      i===0?ctx.moveTo(x,y):ctx.lineTo(x,y);
-    }
+    ctx.moveTo(pts[0][0], pts[0][1]);
+    pts.forEach(p => ctx.lineTo(p[0], p[1]));
+    ctx.closePath();
+    ctx.fillStyle = faceColors[i];
+    ctx.fill();
+    ctx.strokeStyle = isDark ? 'rgba(255,255,255,.15)' : 'rgba(0,0,0,.2)';
+    ctx.lineWidth = 1;
     ctx.stroke();
+    if(showLabels){
+      const mc = pts.reduce((a, p) => [a[0] + p[0]/4, a[1] + p[1]/4], [0,0]);
+      ctx.fillStyle = isDark ? 'rgba(255,255,255,.6)' : 'rgba(0,0,0,.5)';
+      ctx.font = 'bold 12px system-ui';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(labels[i], mc[0], mc[1]);
+    }
+  });
+
+  [['X','#e24b4a',[1,0,0]],['Y','#1d9e75',[0,1,0]],['Z','#378add',[0,0,1]]].forEach(([l,c,d]) => {
+    const [ex, ey] = rotVert(d.map(v => v*1.5));
+    ctx.beginPath();
+    ctx.strokeStyle = c;
+    ctx.lineWidth = 1.5;
+    ctx.moveTo(cx, cy);
+    ctx.lineTo(ex, ey);
+    ctx.stroke();
+    ctx.fillStyle = c;
+    ctx.font = 'bold 10px system-ui';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(l, ex, ey - 8);
   });
 }
 
-const oscCanvases={};
+function drawCubeSmall(){
+  const canvas = document.getElementById('cubeSmall');
+  if(!canvas) return;
+  cubeAngles.x += (targetAngles.x - cubeAngles.x) * 0.08;
+  cubeAngles.y += (targetAngles.y - cubeAngles.y) * 0.08;
+  cubeAngles.z += (targetAngles.z - cubeAngles.z) * 0.08;
+  drawCubeOnCanvas(canvas, 52, true);
+}
+
+function draw3dFull(){
+  if(currentTab !== '3d') return;
+  const canvas = document.getElementById('cube3d');
+  const panel = document.getElementById('panel-3d');
+  if(!canvas || !panel) return;
+  canvas.width = panel.offsetWidth || 500;
+  canvas.height = panel.offsetHeight || 400;
+  drawCubeOnCanvas(canvas, Math.min(canvas.width, canvas.height)/3.5, false);
+  requestAnimationFrame(draw3dFull);
+}
+
+// ---------- Oscilloscope drawing ----------
+const oscCanvases = {};
 function getOscCtx(id){
   if(!oscCanvases[id]){
-    const c=document.getElementById(id);
-    oscCanvases[id]={c,ctx:c.getContext('2d')};
+    const c = document.getElementById(id);
+    oscCanvases[id] = {c, ctx: c.getContext('2d')};
   }
   return oscCanvases[id];
 }
 
 function drawOscilloscopes(){
-  Object.entries(CHANNELS).forEach(([key,cfg])=>{
-    if(!CHANNELS_ACTIVE[key])return;
-    const {c,ctx}=getOscCtx('osc_'+key);
-    const row=document.getElementById('osc_'+key+'_row');
-    if(!row||row.style.display==='none')return;
-    const w=row.offsetWidth||500,h=row.offsetHeight||60;
-    if(c.width!==w||c.height!==h){c.width=w;c.height=h}
-    ctx.clearRect(0,0,w,h);
+  Object.entries(CHANNELS).forEach(([key, cfg]) => {
+    if(!CHANNELS_ACTIVE[key]) return;
+    const {c, ctx} = getOscCtx('osc_'+key);
+    const row = document.getElementById('osc_'+key+'_row');
+    if(!row || row.style.display === 'none') return;
+    const w = row.offsetWidth || 500, h = row.offsetHeight || 60;
+    if(c.width !== w || c.height !== h){ c.width = w; c.height = h; }
+    ctx.clearRect(0, 0, w, h);
 
-    const nGrid=5;
-    ctx.strokeStyle=GRID_COLOR;ctx.lineWidth=0.5;
-    for(let i=1;i<nGrid;i++){const y=i/nGrid*h;ctx.beginPath();ctx.moveTo(0,y);ctx.lineTo(w,y);ctx.stroke()}
-    ctx.strokeStyle=ZERO_COLOR;ctx.lineWidth=0.8;
-    ctx.beginPath();ctx.moveTo(0,h/2);ctx.lineTo(w,h/2);ctx.stroke();
+    const nGrid = 5;
+    ctx.strokeStyle = GRID_COLOR; ctx.lineWidth = 0.5;
+    for(let i=1; i<nGrid; i++){ const y = i/nGrid*h; ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(w,y); ctx.stroke(); }
+    ctx.strokeStyle = ZERO_COLOR; ctx.lineWidth = 0.8;
+    ctx.beginPath(); ctx.moveTo(0, h/2); ctx.lineTo(w, h/2); ctx.stroke();
 
-    ctx.fillStyle=TEXT_COLOR;ctx.font='9px monospace';
-    ctx.fillText('+'+cfg.range+cfg.unit,3,10);
-    ctx.fillText('-'+cfg.range+cfg.unit,3,h-3);
+    ctx.fillStyle = TEXT_COLOR; ctx.font = '9px monospace';
+    ctx.fillText('+'+cfg.range+cfg.unit, 3, 10);
+    ctx.fillText('-'+cfg.range+cfg.unit, 3, h-3);
 
-    const data=history[key];
-    const n=Math.min(data.length,OSC_WINDOW);
-    if(n<2)return;
-    const slice=data.slice(data.length-n);
-    ctx.beginPath();ctx.strokeStyle=cfg.color;ctx.lineWidth=1.5;
-    for(let i=0;i<slice.length;i++){
-      const x=i/(slice.length-1)*w;
-      const y=h/2-slice[i]/cfg.range*(h/2)*0.9;
-      i===0?ctx.moveTo(x,y):ctx.lineTo(x,y);
+    const data = history[key];
+    const n = Math.min(data.length, OSC_WINDOW);
+    if(n < 2) return;
+    const slice = data.slice(data.length - n);
+    ctx.beginPath(); ctx.strokeStyle = cfg.color; ctx.lineWidth = 1.5;
+    for(let i=0; i<slice.length; i++){
+      const x = i/(slice.length-1)*w;
+      const y = h/2 - slice[i]/cfg.range*(h/2)*0.9;
+      i===0 ? ctx.moveTo(x,y) : ctx.lineTo(x,y);
     }
     ctx.stroke();
   });
 }
 
+// ---------- FFT ----------
 function drawFFT(){
-  if(currentTab!=='fft')return;
-  const canvas=document.getElementById('fftCanvas');
-  const w=canvas.offsetWidth||500,h=canvas.offsetHeight||200;
-  if(canvas.width!==w||canvas.height!==h){canvas.width=w;canvas.height=h}
-  const ctx=canvas.getContext('2d');
-  ctx.clearRect(0,0,w,h);
+  if(currentTab !== 'fft') return;
+  const canvas = document.getElementById('fftCanvas');
+  const w = canvas.offsetWidth || 500, h = canvas.offsetHeight || 200;
+  if(canvas.width !== w || canvas.height !== h){ canvas.width = w; canvas.height = h; }
+  const ctx = canvas.getContext('2d');
+  ctx.clearRect(0, 0, w, h);
 
-  const data=history.ax;
-  const n=Math.min(512,data.length);
-  if(n<64)return;
-  const slice=data.slice(data.length-n);
+  const data = history.ax;
+  const rawN = Math.min(1024, data.length);
+  const n = nextPowerOfTwo(rawN);
+  if(n < 8) return;
+  const slice = data.slice(data.length - n);
 
-  const re=[...slice,...new Array(n).fill(0)];
-  const im=new Array(n*2).fill(0);
-  simpleFFT(re,im,n);
+  const re = [...slice, ...new Array(n - slice.length).fill(0)];
+  const im = new Array(n).fill(0);
 
-  const bins=n/2;
-  const maxFreq=50;
-  const freqStep=100/n;
-  const maxBin=Math.floor(maxFreq/freqStep);
-
-  let maxMag=0;
-  const mags=[];
-  for(let i=1;i<Math.min(maxBin,bins);i++){
-    const mag=Math.sqrt(re[i]*re[i]+im[i]*im[i]);
-    mags.push(mag);if(mag>maxMag)maxMag=mag;
-  }
-
-  ctx.fillStyle=isDark?'#1a1a1a':'#f5f5f2';ctx.fillRect(0,0,w,h);
-  ctx.strokeStyle=GRID_COLOR;ctx.lineWidth=0.5;
-  for(let i=1;i<5;i++){const y=i/5*h;ctx.beginPath();ctx.moveTo(0,y);ctx.lineTo(w,y);ctx.stroke()}
-  [1,2,5,10,20,50].forEach(f=>{
-    const x=f/maxFreq*w;
-    ctx.strokeStyle=GRID_COLOR;ctx.beginPath();ctx.moveTo(x,0);ctx.lineTo(x,h);ctx.stroke();
-    ctx.fillStyle=TEXT_COLOR;ctx.font='9px monospace';ctx.fillText(f+'Hz',x+2,h-4);
-  });
-
-  ctx.beginPath();ctx.strokeStyle='#378add';ctx.lineWidth=2;
-  mags.forEach((m,i)=>{
-    const x=i/mags.length*w;
-    const y=h-(m/(maxMag+1e-9))*(h-10);
-    i===0?ctx.moveTo(x,y):ctx.lineTo(x,y);
-  });
-  ctx.stroke();
-  ctx.fillStyle='rgba(55,138,221,0.15)';ctx.lineTo(w,h);ctx.lineTo(0,h);ctx.closePath();ctx.fill();
-
-  ctx.fillStyle=TEXT_COLOR;ctx.font='10px monospace';ctx.fillText('Frequency spectrum (ax)',8,14);
-}
-
-function simpleFFT(re,im,n){
+  // simple FFT (in-place)
   for(let i=0,j=0;i<n;i++){
-    if(i<j){let t=re[i];re[i]=re[j];re[j]=t}
-    let m=n>>1;for(;j&m;m>>=1)j^=m;j^=m;
+    if(i<j){ let t=re[i]; re[i]=re[j]; re[j]=t; }
+    let m = n>>1;
+    for(; j&m; m>>=1) j ^= m;
+    j ^= m;
   }
-  for(let s=2;s<=n;s<<=1){
-    const angle=-2*Math.PI/s;
-    const wr=Math.cos(angle),wi=Math.sin(angle);
-    for(let k=0;k<n;k+=s){
-      let cr=1,ci=0;
-      for(let j=0;j<s/2;j++){
-        const tr=cr*re[k+j+s/2]-ci*im[k+j+s/2];
-        const ti=cr*im[k+j+s/2]+ci*re[k+j+s/2];
-        re[k+j+s/2]=re[k+j]-tr;im[k+j+s/2]=im[k+j]-ti;
-        re[k+j]+=tr;im[k+j]+=ti;
-        const ncr=cr*wr-ci*wi;ci=cr*wi+ci*wr;cr=ncr;
+  for(let s=2; s<=n; s<<=1){
+    const angle = -2*Math.PI/s;
+    const wr = Math.cos(angle), wi = Math.sin(angle);
+    for(let k=0; k<n; k+=s){
+      let cr=1, ci=0;
+      for(let j=0; j<s/2; j++){
+        const tr = cr*re[k+j+s/2] - ci*im[k+j+s/2];
+        const ti = cr*im[k+j+s/2] + ci*re[k+j+s/2];
+        re[k+j+s/2] = re[k+j] - tr;
+        im[k+j+s/2] = im[k+j] - ti;
+        re[k+j] += tr;
+        im[k+j] += ti;
+        const ncr = cr*wr - ci*wi;
+        ci = cr*wi + ci*wr;
+        cr = ncr;
       }
     }
   }
-}
 
-function drawCubeSmall(){
-  const canvas=document.getElementById('cubeSmall');
-  const ctx=canvas.getContext('2d');
-  const w=canvas.width,h=canvas.height;
-  ctx.clearRect(0,0,w,h);
+  // compute actual sample rate from buffer
+  let sampleRate = 100;
+  if(sampleRateBuffer.length > 5){
+    const dt = (sampleRateBuffer[sampleRateBuffer.length-1] - sampleRateBuffer[0]) / (sampleRateBuffer.length - 1);
+    if(dt > 0) sampleRate = Math.round(1000 / dt);
+  }
+  const maxFreq = sampleRate / 2;
+  const freqStep = sampleRate / n;
+  const maxBin = Math.min(n/2, Math.floor(maxFreq / freqStep));
 
-  cubeAngles.x+=(targetAngles.x-cubeAngles.x)*0.08;
-  cubeAngles.y+=(targetAngles.y-cubeAngles.y)*0.08;
-  cubeAngles.z+=(targetAngles.z-cubeAngles.z)*0.08;
-
-  const cx=w/2,cy=h/2,size=52;
-  const rx=cubeAngles.x,ry=cubeAngles.y,rz=cubeAngles.z;
-
-  function rotVert(v){
-    let [x,y,z]=v;
-    let y2=y*Math.cos(rx)-z*Math.sin(rx),z2=y*Math.sin(rx)+z*Math.cos(rx);
-    y=y2;z=z2;
-    let x2=x*Math.cos(ry)+z2*Math.sin(ry),z3=-x*Math.sin(ry)+z2*Math.cos(ry);
-    x=x2;z=z3;
-    let x3=x2*Math.cos(rz)-y*Math.sin(rz),y3=x2*Math.sin(rz)+y*Math.cos(rz);
-    const sc=280/(280+z);
-    return[cx+x3*size*sc,cy-y3*size*sc,z];
+  let maxMag = 0;
+  const mags = [];
+  for(let i=1; i<maxBin; i++){
+    const mag = Math.sqrt(re[i]*re[i] + im[i]*im[i]);
+    mags.push(mag);
+    if(mag > maxMag) maxMag = mag;
   }
 
-  const verts=[[-1,-1,-1],[1,-1,-1],[1,1,-1],[-1,1,-1],[-1,-1,1],[1,-1,1],[1,1,1],[-1,1,1]];
-  const faces=[[0,1,2,3],[4,5,6,7],[0,1,5,4],[2,3,7,6],[0,3,7,4],[1,2,6,5]];
-  const faceColors=isDark?
-    ['#1d4670','#1d3b30','#5a2a1a','#2d1f60','#5a1a30','#4a3010']:
-    ['#b5d4f4','#9fe1cb','#f5c4b3','#cecbf6','#f4c0d1','#fac775'];
-  const labels=['X','X','Z','Z','Y','Y'];
-
-  const projected=verts.map(v=>rotVert(v));
-  const facesWithZ=faces.map((f,i)=>{
-    const z=f.reduce((s,vi)=>s+projected[vi][2],0)/4;
-    return{f,i,z};
-  }).sort((a,b)=>a.z-b.z);
-
-  facesWithZ.forEach(({f,i})=>{
-    const pts=f.map(vi=>projected[vi]);
-    ctx.beginPath();
-    ctx.moveTo(pts[0][0],pts[0][1]);
-    pts.forEach(p=>ctx.lineTo(p[0],p[1]));
-    ctx.closePath();
-    ctx.fillStyle=faceColors[i];ctx.fill();
-    ctx.strokeStyle=isDark?'rgba(255,255,255,.15)':'rgba(0,0,0,.2)';ctx.lineWidth=1;ctx.stroke();
-    const mc=pts.reduce((a,p)=>[a[0]+p[0]/4,a[1]+p[1]/4],[0,0]);
-    ctx.fillStyle=isDark?'rgba(255,255,255,.6)':'rgba(0,0,0,.5)';
-    ctx.font='bold 12px system-ui';ctx.textAlign='center';ctx.textBaseline='middle';
-    ctx.fillText(labels[i],mc[0],mc[1]);
+  ctx.fillStyle = isDark ? '#1a1a1a' : '#f5f5f2';
+  ctx.fillRect(0, 0, w, h);
+  ctx.strokeStyle = GRID_COLOR; ctx.lineWidth = 0.5;
+  for(let i=1; i<5; i++){ const y = i/5*h; ctx.beginPath(); ctx.moveTo(0,y); ctx.lineTo(w,y); ctx.stroke(); }
+  // frequency labels
+  const freqLabels = [1, 2, 5, 10, 20, 50, 100];
+  freqLabels.forEach(f => {
+    if(f > maxFreq) return;
+    const x = f/maxFreq * w;
+    ctx.strokeStyle = GRID_COLOR; ctx.beginPath(); ctx.moveTo(x,0); ctx.lineTo(x,h); ctx.stroke();
+    ctx.fillStyle = TEXT_COLOR; ctx.font = '9px monospace'; ctx.fillText(f+'Hz', x+2, h-4);
   });
 
-  const axLen=65;
-  [['X','#e24b4a',[1,0,0]],['Y','#1d9e75',[0,1,0]],['Z','#378add',[0,0,1]]].forEach(([l,c,d])=>{
-    const[ex,ey]=rotVert(d.map(v=>v*1.5));
-    ctx.beginPath();ctx.strokeStyle=c;ctx.lineWidth=1.5;
-    ctx.moveTo(cx,cy);ctx.lineTo(ex,ey);ctx.stroke();
-    ctx.fillStyle=c;ctx.font='bold 10px system-ui';ctx.textAlign='center';ctx.textBaseline='middle';
-    ctx.fillText(l,ex,ey-8);
+  ctx.beginPath(); ctx.strokeStyle = '#378add'; ctx.lineWidth = 2;
+  mags.forEach((m, i) => {
+    const x = i/mags.length * w;
+    const y = h - (m/(maxMag+1e-9))*(h-10);
+    i===0 ? ctx.moveTo(x,y) : ctx.lineTo(x,y);
   });
+  ctx.stroke();
+  ctx.fillStyle = 'rgba(55,138,221,0.15)';
+  ctx.lineTo(w,h); ctx.lineTo(0,h); ctx.closePath(); ctx.fill();
+
+  ctx.fillStyle = TEXT_COLOR; ctx.font = '10px monospace';
+  ctx.fillText('Frequency spectrum (ax) — '+sampleRate+' Hz', 8, 14);
 }
 
-function draw3dFull(){
-  if(currentTab!=='3d')return;
-  const canvas=document.getElementById('cube3d');
-  const panel=document.getElementById('panel-3d');
-  canvas.width=panel.offsetWidth||500;canvas.height=panel.offsetHeight-20||400;
-  drawCubeSmall();
-  const ctx=canvas.getContext('2d');
-  ctx.clearRect(0,0,canvas.width,canvas.height);
-  requestAnimationFrame(draw3dFull);
-}
-
-let frameN=0;
+// ---------- Main render loop ----------
+let frameN = 0;
 function renderLoop(){
   frameN++;
-  if(frameN%2===0) drawOscilloscopes();
-  if(currentTab==='fft'&&frameN%5===0) drawFFT();
+  if(frameN % 2 === 0) drawOscilloscopes();
+  if(currentTab === 'fft' && frameN % 5 === 0) drawFFT();
   drawCubeSmall();
   requestAnimationFrame(renderLoop);
 }
 
-document.getElementById('panel-osc').style.display='flex';
-['fft','3d','replay'].forEach(t=>{
-  const el=document.getElementById('panel-'+t);
-  if(el)el.style.display='none';
+// ---------- Initialisation ----------
+document.getElementById('panel-osc').style.display = 'flex';
+['fft','3d','replay'].forEach(t => {
+  const el = document.getElementById('panel-'+t);
+  if(el) el.style.display = 'none';
 });
 
-uptimeStart=Date.now();
+uptimeStart = Date.now();
 startSim();
 renderLoop();
 </script>
